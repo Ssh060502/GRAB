@@ -112,9 +112,18 @@ def solve_arm(robot, wrist_pos, wrist_rotmat, calib, arm_idx, hand_idx, link_id,
     return res.x
 
 
-def solve_fingers(robot, wrist_pos, tips, finger_idx, origin_id, tip_ids, joint_limits, x0):
-    """One frame of Step 2. Returns the 12 finger joint values."""
-    target_vecs = np.stack([tips[f] - wrist_pos for f in ("thumb", "index", "middle", "ring", "pinky")])
+def solve_fingers(robot, wrist_pos, wrist_rotmat, calib, tips, finger_idx, origin_id, tip_ids, joint_limits, x0):
+    """One frame of Step 2. Returns the 12 finger joint values.
+
+    The isolated hand URDF sits at the world origin with identity orientation, so the vector
+    it computes (tip - origin) via forward kinematics is expressed in the hand's OWN local frame.
+    GRAB's wrist-to-fingertip vector is in world frame, so it must be rotated back by the inverse
+    of the same rotation Step 1 used to place the hand (wrist_rotmat @ calib) before the two are
+    comparable -- omitting this was a bug: Step 2's residual used to be identical no matter what
+    --calib-rpy was, because calib never reached this function at all.
+    """
+    R_hand_world = wrist_rotmat @ calib
+    target_vecs = np.stack([R_hand_world.T @ (tips[f] - wrist_pos) for f in ("thumb", "index", "middle", "ring", "pinky")])
     full = np.zeros(robot.dof)
 
     def residual(x):
@@ -170,7 +179,8 @@ def main():
                                arm_idx, hand_idx_in_arm_robot, wrist_link_id, arm_limits, x_arm)
             arm_qpos[t] = x_arm
             tips_t = {k: v[t] for k, v in kp["tips"].items()}
-            x_fin = solve_fingers(hand_robot, kp["wrist_pos"][t], tips_t, finger_idx, origin_id, tip_ids, finger_limits, x_fin)
+            x_fin = solve_fingers(hand_robot, kp["wrist_pos"][t], kp["wrist_rotmat"][t], calib,
+                                   tips_t, finger_idx, origin_id, tip_ids, finger_limits, x_fin)
             finger_qpos[t] = x_fin
             if t % 100 == 0:
                 print(f"frame {t}/{T}")
@@ -203,9 +213,10 @@ def main():
             full_hand[finger_idx] = finger_qpos[t]
             hand_robot.compute_forward_kinematics(full_hand)
             origin_pos = hand_robot.get_link_pose(origin_id)[:3, 3]
+            R_hand_world = kp["wrist_rotmat"][t] @ calib
             for i, name in enumerate(finger_names):
                 tip_pos = hand_robot.get_link_pose(tip_ids[i])[:3, 3]
-                target_vec = kp["tips"][name][t] - kp["wrist_pos"][t]
+                target_vec = R_hand_world.T @ (kp["tips"][name][t] - kp["wrist_pos"][t])
                 finger_err[t, i] = np.linalg.norm((tip_pos - origin_pos) - target_vec)
 
         eps = 1e-3
