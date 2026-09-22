@@ -185,17 +185,42 @@ def main():
         f.attrs["qpos_is_placeholder"] = 0
         f.attrs["retarget_calib_rpy_deg"] = args.calib_rpy
 
-        # sanity print: Step-1 residual (should be near 0, or the IK could not reach the target)
-        arm_robot.compute_forward_kinematics(np.zeros(arm_robot.dof))
-        err = []
-        full = np.zeros(arm_robot.dof)
-        for t in (0, T // 2, T - 1):
-            full[arm_idx] = arm_qpos[t]
-            arm_robot.compute_forward_kinematics(full)
-            pos = arm_robot.get_link_pose(wrist_link_id)[:3, 3]
-            err.append(np.linalg.norm(pos - kp["wrist_pos"][t]))
-        print(f"wrist position residual at frames [0, mid, last]: {np.round(err, 5)} m")
-    print("saved qpos into", args.h5)
+        # ---- diagnostics over ALL frames (no Isaac Sim needed) ------------------------------
+        pos_err = np.zeros(T)
+        rot_err_deg = np.zeros(T)
+        finger_err = np.zeros((T, 5))  # per-finger vector-matching residual, meters
+        full_arm = np.zeros(arm_robot.dof)
+        full_hand = np.zeros(hand_robot.dof)
+        finger_names = ("thumb", "index", "middle", "ring", "pinky")
+        for t in range(T):
+            full_arm[arm_idx] = arm_qpos[t]
+            arm_robot.compute_forward_kinematics(full_arm)
+            pose = arm_robot.get_link_pose(wrist_link_id)
+            pos_err[t] = np.linalg.norm(pose[:3, 3] - kp["wrist_pos"][t])
+            target_rot = kp["wrist_rotmat"][t] @ calib
+            rot_err_deg[t] = R.from_matrix(pose[:3, :3].T @ target_rot).magnitude() * 180 / np.pi
+
+            full_hand[finger_idx] = finger_qpos[t]
+            hand_robot.compute_forward_kinematics(full_hand)
+            origin_pos = hand_robot.get_link_pose(origin_id)[:3, 3]
+            for i, name in enumerate(finger_names):
+                tip_pos = hand_robot.get_link_pose(tip_ids[i])[:3, 3]
+                target_vec = kp["tips"][name][t] - kp["wrist_pos"][t]
+                finger_err[t, i] = np.linalg.norm((tip_pos - origin_pos) - target_vec)
+
+        eps = 1e-3
+        arm_sat = np.mean(np.any((arm_qpos - arm_limits[:, 0] < eps) | (arm_limits[:, 1] - arm_qpos < eps), axis=1))
+        fin_sat = np.mean(np.any((finger_qpos - finger_limits[:, 0] < eps) | (finger_limits[:, 1] - finger_qpos < eps), axis=1))
+
+        print("\n=== Step 1 (arm, position): wrist match over all frames ===")
+        print(f"  position error   mean {pos_err.mean()*1000:.2f} mm   max {pos_err.max()*1000:.2f} mm")
+        print(f"  orientation error mean {rot_err_deg.mean():.2f} deg  max {rot_err_deg.max():.2f} deg  (large mean here usually means --calib-rpy is wrong)")
+        print(f"  frames with an arm joint at its limit: {arm_sat*100:.1f}%")
+        print("=== Step 2 (fingers, vector): per-finger fit residual (mm) ===")
+        for i, name in enumerate(finger_names):
+            print(f"  {name:7s} mean {finger_err[:, i].mean()*1000:6.2f}  max {finger_err[:, i].max()*1000:6.2f}")
+        print(f"  frames with a finger joint at its limit: {fin_sat*100:.1f}%")
+    print("\nsaved qpos into", args.h5)
 
 
 if __name__ == "__main__":
