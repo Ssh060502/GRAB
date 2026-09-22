@@ -231,6 +231,37 @@ def main():
         arm_sat = np.mean(np.any((arm_qpos - arm_limits[:, 0] < eps) | (arm_limits[:, 1] - arm_qpos < eps), axis=1))
         fin_sat = np.mean(np.any((finger_qpos - finger_limits[:, 0] < eps) | (finger_limits[:, 1] - finger_qpos < eps), axis=1))
 
+        # ---- scale check: is the human target even within the robot's *physical* reach? ---------
+        # For each finger, bracket the robot's own achievable tip-to-origin distance by evaluating
+        # that finger's 2 joints at {lower limit, 0, upper limit} (other joints held at 0), and
+        # compare against the human vector length actually being asked for (mean/min/max over the
+        # whole clip). If the human numbers fall outside the robot bracket, no calibration rotation
+        # can ever fix Step 2 -- the two hands are simply not compatible sizes for this finger.
+        print("\n=== scale check: human wrist-to-fingertip distance vs robot's own physical reach (mm) ===")
+        finger_joint_pairs = {
+            "thumb": ("right_hand_thumb_bend_joint", "right_hand_thumb_rota_joint1"),
+            "index": ("right_hand_index_bend_joint", "right_hand_index_joint1"),
+            "middle": ("right_hand_mid_joint1", "right_hand_mid_joint2"),
+            "ring": ("right_hand_ring_joint1", "right_hand_ring_joint2"),
+            "pinky": ("right_hand_pinky_joint1", "right_hand_pinky_joint2"),
+        }
+        full_probe = np.zeros(hand_robot.dof)
+        for i, name in enumerate(finger_names):
+            human_len = np.linalg.norm(kp["tips"][name] - kp["wrist_pos"], axis=1) * 1000
+            j0, j1 = [hand_robot.get_joint_index(n) for n in finger_joint_pairs[name]]
+            reach = []
+            lo0, hi0 = hand_robot.joint_limits[j0]
+            lo1, hi1 = hand_robot.joint_limits[j1]
+            for a in (lo0, 0.0, hi0):
+                for b in (lo1, 0.0, hi1):
+                    full_probe[:] = 0.0
+                    full_probe[j0], full_probe[j1] = a, b
+                    hand_robot.compute_forward_kinematics(full_probe)
+                    reach.append(np.linalg.norm(hand_robot.get_link_pose(tip_ids[i])[:3, 3] - hand_robot.get_link_pose(origin_id)[:3, 3]))
+            reach = np.array(reach) * 1000
+            print(f"  {name:7s} human [{human_len.min():6.1f}, {human_len.mean():6.1f}, {human_len.max():6.1f}]"
+                  f"   robot reach bracket [{reach.min():6.1f}, {reach.max():6.1f}]")
+
         print("\n=== Step 1 (arm, position): wrist match over all frames ===")
         print(f"  position error   mean {pos_err.mean()*1000:.2f} mm   max {pos_err.max()*1000:.2f} mm")
         print(f"  orientation error mean {rot_err_deg.mean():.2f} deg  max {rot_err_deg.max():.2f} deg  (large mean here usually means --calib-rpy is wrong)")
