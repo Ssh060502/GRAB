@@ -91,9 +91,17 @@ def _qpos_indices(robot, joint_names):
 
 
 def solve_arm(robot, wrist_pos, wrist_rotmat, calib, arm_idx, hand_idx, link_id, joint_limits, x0):
-    """One frame of Step 1. Returns the 7 arm joint values."""
-    axis0 = calib[:, 0]
-    axis1 = calib[:, 1]
+    """One frame of Step 1. Returns the 7 arm joint values.
+
+    axis0/axis1 must be FIXED reference directions, not derived from calib: calib belongs only on
+    the target side (the desired world orientation is wrist_rotmat @ calib). Using calib's own
+    columns as axis0/axis1 was a bug -- since the same axis then appears on both the "robot" and
+    "target" side of the residual, it cancels out algebraically and the fit always converges to
+    rot = wrist_rotmat regardless of calib, silently ignoring --calib-rpy entirely.
+    """
+    axis0 = np.array([1.0, 0.0, 0.0])
+    axis1 = np.array([0.0, 1.0, 0.0])
+    target_rot = wrist_rotmat @ calib
     full = np.zeros(robot.dof)
     full[hand_idx] = 0.0
 
@@ -104,8 +112,8 @@ def solve_arm(robot, wrist_pos, wrist_rotmat, calib, arm_idx, hand_idx, link_id,
         pos, rot = pose[:3, 3], pose[:3, :3]
         p1 = pos + WRIST_OFFSET_M * (rot @ axis0)
         p2 = pos + WRIST_OFFSET_M * (rot @ axis1)
-        target1 = wrist_pos + WRIST_OFFSET_M * (wrist_rotmat @ axis0)
-        target2 = wrist_pos + WRIST_OFFSET_M * (wrist_rotmat @ axis1)
+        target1 = wrist_pos + WRIST_OFFSET_M * (target_rot @ axis0)
+        target2 = wrist_pos + WRIST_OFFSET_M * (target_rot @ axis1)
         return np.concatenate([pos - wrist_pos, p1 - target1, p2 - target2])
 
     res = least_squares(residual, x0, bounds=joint_limits.T, method="trf", xtol=1e-10, ftol=1e-10)
