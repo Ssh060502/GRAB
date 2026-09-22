@@ -238,9 +238,10 @@ def main():
         # whole clip). If the human numbers fall outside the robot bracket, no calibration rotation
         # can ever fix Step 2 -- the two hands are simply not compatible sizes for this finger.
         print("\n=== scale check: human wrist-to-fingertip distance vs robot's own physical reach (mm) ===")
-        finger_joint_pairs = {
-            "thumb": ("right_hand_thumb_bend_joint", "right_hand_thumb_rota_joint1"),
-            "index": ("right_hand_index_bend_joint", "right_hand_index_joint1"),
+        import itertools
+        finger_joints = {
+            "thumb": ("right_hand_thumb_bend_joint", "right_hand_thumb_rota_joint1", "right_hand_thumb_rota_joint2"),
+            "index": ("right_hand_index_bend_joint", "right_hand_index_joint1", "right_hand_index_joint2"),
             "middle": ("right_hand_mid_joint1", "right_hand_mid_joint2"),
             "ring": ("right_hand_ring_joint1", "right_hand_ring_joint2"),
             "pinky": ("right_hand_pinky_joint1", "right_hand_pinky_joint2"),
@@ -248,16 +249,15 @@ def main():
         full_probe = np.zeros(hand_robot.dof)
         for i, name in enumerate(finger_names):
             human_len = np.linalg.norm(kp["tips"][name] - kp["wrist_pos"], axis=1) * 1000
-            j0, j1 = [hand_robot.get_joint_index(n) for n in finger_joint_pairs[name]]
+            js = [hand_robot.get_joint_index(n) for n in finger_joints[name]]
+            bounds = [hand_robot.joint_limits[j] for j in js]  # every joint of THIS finger, none left fixed at 0
             reach = []
-            lo0, hi0 = hand_robot.joint_limits[j0]
-            lo1, hi1 = hand_robot.joint_limits[j1]
-            for a in (lo0, 0.0, hi0):
-                for b in (lo1, 0.0, hi1):
-                    full_probe[:] = 0.0
-                    full_probe[j0], full_probe[j1] = a, b
-                    hand_robot.compute_forward_kinematics(full_probe)
-                    reach.append(np.linalg.norm(hand_robot.get_link_pose(tip_ids[i])[:3, 3] - hand_robot.get_link_pose(origin_id)[:3, 3]))
+            for combo in itertools.product(*[(lo, 0.0, hi) for lo, hi in bounds]):
+                full_probe[:] = 0.0
+                for j, v in zip(js, combo):
+                    full_probe[j] = v
+                hand_robot.compute_forward_kinematics(full_probe)
+                reach.append(np.linalg.norm(hand_robot.get_link_pose(tip_ids[i])[:3, 3] - hand_robot.get_link_pose(origin_id)[:3, 3]))
             reach = np.array(reach) * 1000
             print(f"  {name:7s} human [{human_len.min():6.1f}, {human_len.mean():6.1f}, {human_len.max():6.1f}]"
                   f"   robot reach bracket [{reach.min():6.1f}, {reach.max():6.1f}]")
