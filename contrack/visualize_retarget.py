@@ -102,6 +102,7 @@ def main():
     # URDF's own root at (0,0,0), so every rendered link position needs +right_base to land in the
     # same world frame the object (obj_t, already an absolute ConTrack-world position) is drawn in.
     # Omitting this drew the robot roughly `right_base` (0.4 m) away from where the object actually is.
+    print(f"robot base (base_translation, right hand) = {right_base.tolist()}  <- ground truth, not a screenshot guess")
 
     obj_R = R.from_quat(obj_q).as_matrix()
     frame_ids = list(range(0, qpos.shape[0], args.stride))
@@ -114,12 +115,20 @@ def main():
     center = all_pos.mean(0)
     radius = float(np.max(np.linalg.norm(all_pos - center, axis=-1))) + 0.3
 
+    # explicit ground plane at z=0, so "is the base actually at ground level" is a visible fact,
+    # not something to eyeball off two screenshots with different zoom/aspect settings
+    gx, gy = np.meshgrid(np.linspace(center[0] - radius, center[0] + radius, 2),
+                          np.linspace(center[1] - radius, center[1] + radius, 2))
+    gz = np.zeros_like(gx)
+
     full = np.zeros(robot.dof)
     frames = []
     fig = plt.figure(figsize=(6, 6))
     ax = fig.add_subplot(projection="3d")
     for t in frame_ids:
         ax.cla()
+        ax.plot_surface(gx, gy, gz, color="gray", alpha=0.15, linewidth=0)
+        ax.scatter(*right_base, color="black", s=40, marker="^", label="robot base (z=0)")
         obj_w = obj_v @ obj_R[t].T + obj_t[t]
         ax.plot_trisurf(obj_w[:, 0], obj_w[:, 1], obj_w[:, 2], triangles=obj_f, color="tab:orange", alpha=0.9, linewidth=0)
 
@@ -138,6 +147,7 @@ def main():
         ax.set_box_aspect((1, 1, 1))  # matplotlib 3D doesn't enforce equal x/y/z scale by default,
         # which was making the (real, meter-scale) robot mesh look artificially compressed/undersized
         ax.set_title(f"frame {t}/{qpos.shape[0]}")
+        ax.legend(loc="upper left", fontsize=7)
         fig.canvas.draw()
         frames.append(np.asarray(fig.canvas.buffer_rgba())[..., :3].copy())
         if t % (args.stride * 20) == 0:
