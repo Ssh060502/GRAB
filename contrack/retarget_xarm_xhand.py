@@ -335,10 +335,20 @@ def main():
         print(f"  position error   mean {pos_err.mean()*1000:.2f} mm   max {pos_err.max()*1000:.2f} mm")
         print(f"  orientation error mean {rot_err_deg.mean():.2f} deg  max {rot_err_deg.max():.2f} deg  (large mean here usually means --calib-rpy is wrong)")
         print(f"  frames with an arm joint at its limit: {arm_sat*100:.1f}%")
-        print("=== Step 2 (fingers, vector): per-finger fit residual (mm) ===")
+        print("=== Step 2 (fingers, vector): per-finger fit residual (mm), ALL frames (mixes plain-vector and contact-point targets) ===")
         for i, name in enumerate(finger_names):
             print(f"  {name:7s} mean {finger_err[:, i].mean()*1000:6.2f}  max {finger_err[:, i].max()*1000:6.2f}")
         print(f"  frames with a finger joint at its limit: {fin_sat*100:.1f}%")
+
+        if contact_targets_all is not None:
+            print("=== Step 2: residual on ONLY the contact-priority frames (mm) -- the number that actually matters for grasping ===")
+            for i, name in enumerate(finger_names):
+                mask = np.isfinite(contact_targets_all[:, i]).all(axis=1)
+                if not mask.any():
+                    print(f"  {name:7s} (no contact-priority frames for this finger)")
+                    continue
+                e = finger_err[mask, i] * 1000
+                print(f"  {name:7s} n={int(mask.sum()):4d}  mean {e.mean():6.2f}  max {e.max():6.2f}  frac<10mm {(e<10).mean()*100:5.1f}%")
     print("\nsaved qpos into", args.h5)
 
 

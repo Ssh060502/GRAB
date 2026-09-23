@@ -76,6 +76,10 @@ def main():
     ap.add_argument("--assets-dir", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--stride", type=int, default=4, help="render every Nth frame")
+    ap.add_argument("--zoom-frame", type=int, default=None,
+                    help="render a single frame as a PNG (ignores --stride/--out's video encoding), zoomed tightly "
+                         "on the object so any hand-object gap is actually visible, instead of the whole arm+room "
+                         "view where a few cm gap is hard to see. --out is still used as the file path.")
     args = ap.parse_args()
 
     from dex_retargeting.robot_wrapper import RobotWrapper
@@ -105,21 +109,31 @@ def main():
     print(f"robot base (base_translation, right hand) = {right_base.tolist()}  <- ground truth, not a screenshot guess")
 
     obj_R = R.from_quat(obj_q).as_matrix()
-    frame_ids = list(range(0, qpos.shape[0], args.stride))
 
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    all_pos = np.concatenate([obj_t, right_base[None]])  # include the arm's base so the whole arm stays in frame
-    center = all_pos.mean(0)
-    radius = float(np.max(np.linalg.norm(all_pos - center, axis=-1))) + 0.3
+    zoom = args.zoom_frame is not None
+    if zoom:
+        # tight close-up on the object at one specific frame, so a few-cm hand-object gap is
+        # actually visible -- the whole-arm+room view averages/zooms out too much to see it clearly
+        frame_ids = [args.zoom_frame]
+        center = obj_t[args.zoom_frame]
+        radius = 0.12
+    else:
+        frame_ids = list(range(0, qpos.shape[0], args.stride))
+        all_pos = np.concatenate([obj_t, right_base[None]])  # include the arm's base so it stays in frame
+        center = all_pos.mean(0)
+        radius = float(np.max(np.linalg.norm(all_pos - center, axis=-1))) + 0.3
 
-    # explicit ground plane at z=0, so "is the base actually at ground level" is a visible fact,
-    # not something to eyeball off two screenshots with different zoom/aspect settings
-    gx, gy = np.meshgrid(np.linspace(center[0] - radius, center[0] + radius, 2),
-                          np.linspace(center[1] - radius, center[1] + radius, 2))
-    gz = np.zeros_like(gx)
+    # explicit ground plane at z=0 (skipped in zoom mode -- irrelevant at this scale, and the base
+    # itself is likely well outside a 12 cm close-up), so "is the base actually at ground level" is
+    # a visible fact in the wide view, not something to eyeball off two differently-zoomed screenshots
+    if not zoom:
+        gx, gy = np.meshgrid(np.linspace(center[0] - radius, center[0] + radius, 2),
+                              np.linspace(center[1] - radius, center[1] + radius, 2))
+        gz = np.zeros_like(gx)
 
     full = np.zeros(robot.dof)
     frames = []
@@ -127,8 +141,9 @@ def main():
     ax = fig.add_subplot(projection="3d")
     for t in frame_ids:
         ax.cla()
-        ax.plot_surface(gx, gy, gz, color="gray", alpha=0.15, linewidth=0)
-        ax.scatter(*right_base, color="black", s=40, marker="^", label="robot base (z=0)")
+        if not zoom:
+            ax.plot_surface(gx, gy, gz, color="gray", alpha=0.15, linewidth=0)
+            ax.scatter(*right_base, color="black", s=40, marker="^", label="robot base (z=0)")
         obj_w = obj_v @ obj_R[t].T + obj_t[t]
         ax.plot_trisurf(obj_w[:, 0], obj_w[:, 1], obj_w[:, 2], triangles=obj_f, color="tab:orange", alpha=0.9, linewidth=0)
 
@@ -146,13 +161,20 @@ def main():
         ax.set_zlim(center[2] - radius, center[2] + radius)
         ax.set_box_aspect((1, 1, 1))  # matplotlib 3D doesn't enforce equal x/y/z scale by default,
         # which was making the (real, meter-scale) robot mesh look artificially compressed/undersized
-        ax.set_title(f"frame {t}/{qpos.shape[0]}")
-        ax.legend(loc="upper left", fontsize=7)
+        ax.set_title(f"frame {t}/{qpos.shape[0]}" + ("  (zoom)" if zoom else ""))
+        if not zoom:
+            ax.legend(loc="upper left", fontsize=7)
         fig.canvas.draw()
         frames.append(np.asarray(fig.canvas.buffer_rgba())[..., :3].copy())
-        if t % (args.stride * 20) == 0:
+        if zoom or t % (args.stride * 20) == 0:
             print(f"rendered {t}/{qpos.shape[0]}")
     plt.close(fig)
+
+    if zoom:
+        import imageio.v2 as imageio
+        imageio.imwrite(args.out, frames[0])
+        print("saved", args.out)
+        return
 
     fps = 120.0 / args.stride
     try:
