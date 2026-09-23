@@ -166,6 +166,16 @@ def main():
         T = kp["wrist_pos"].shape[0]
         calib = R.from_euler("xyz", args.calib_rpy, degrees=True).as_matrix()
 
+        # ConTrack spawns xarm_xhand_right's own root (link_base) at base_translation in the world
+        # (confirmed by reading xarm_xhand_env_cfg.py's init_state=...pos=base_translation), but
+        # RobotWrapper/pinocchio's forward kinematics reports link poses relative to the URDF's own
+        # root sitting at (0,0,0) -- i.e. relative to the robot's OWN base, not ConTrack world. Step
+        # 1 must therefore solve in that base-relative frame: subtract base_translation from the
+        # wrist target before matching it against arm FK output. Step 2 does not need this: its
+        # vectors (tip - wrist) are unaffected by adding/subtracting the same constant to both ends.
+        right_base = f["base_translation"][1]  # is_rhand = [0, 1] -> index 1 is the right hand
+        wrist_pos_arm_frame = kp["wrist_pos"] - right_base
+
         arm_robot = RobotWrapper(os.path.join(args.assets_dir, "urdf", "xarm_xhand_right.urdf"))
         arm_idx = _qpos_indices(arm_robot, XARM_JOINT_NAMES)
         hand_idx_in_arm_robot = _qpos_indices(arm_robot, HAND_JOINT_NAMES)
@@ -183,7 +193,7 @@ def main():
         x_arm = np.clip(np.zeros(7), arm_limits[:, 0], arm_limits[:, 1])
         x_fin = np.clip(np.zeros(12), finger_limits[:, 0], finger_limits[:, 1])
         for t in range(T):
-            x_arm = solve_arm(arm_robot, kp["wrist_pos"][t], kp["wrist_rotmat"][t], calib,
+            x_arm = solve_arm(arm_robot, wrist_pos_arm_frame[t], kp["wrist_rotmat"][t], calib,
                                arm_idx, hand_idx_in_arm_robot, wrist_link_id, arm_limits, x_arm)
             arm_qpos[t] = x_arm
             tips_t = {k: v[t] for k, v in kp["tips"].items()}
@@ -214,7 +224,7 @@ def main():
             full_arm[arm_idx] = arm_qpos[t]
             arm_robot.compute_forward_kinematics(full_arm)
             pose = arm_robot.get_link_pose(wrist_link_id)
-            pos_err[t] = np.linalg.norm(pose[:3, 3] - kp["wrist_pos"][t])
+            pos_err[t] = np.linalg.norm(pose[:3, 3] - wrist_pos_arm_frame[t])
             target_rot = kp["wrist_rotmat"][t] @ calib
             rot_err_deg[t] = R.from_matrix(pose[:3, :3].T @ target_rot).magnitude() * 180 / np.pi
 
