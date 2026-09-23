@@ -95,6 +95,13 @@ def main():
         obj_f = f["object_tracks/0/faces"][:]
         obj_t = f["object_tracks/0/translations"][:]
         obj_q = f["object_tracks/0/orientations_xyzw"][:]
+        right_base = f["base_translation"][1]  # is_rhand=[0,1] -> index 1 is the right hand
+
+    # ConTrack spawns the robot's own root at base_translation in world space (same fact used to
+    # fix retarget_xarm_xhand.py's Step 1); get_link_pose() below reports poses relative to the
+    # URDF's own root at (0,0,0), so every rendered link position needs +right_base to land in the
+    # same world frame the object (obj_t, already an absolute ConTrack-world position) is drawn in.
+    # Omitting this drew the robot roughly `right_base` (0.4 m) away from where the object actually is.
 
     obj_R = R.from_quat(obj_q).as_matrix()
     frame_ids = list(range(0, qpos.shape[0], args.stride))
@@ -103,9 +110,9 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    all_pos = obj_t
+    all_pos = np.concatenate([obj_t, right_base[None]])  # include the arm's base so the whole arm stays in frame
     center = all_pos.mean(0)
-    radius = float(np.max(np.linalg.norm(all_pos - center, axis=-1))) + 0.4
+    radius = float(np.max(np.linalg.norm(all_pos - center, axis=-1))) + 0.7
 
     full = np.zeros(robot.dof)
     frames = []
@@ -122,7 +129,7 @@ def main():
             pose = robot.get_link_pose(link_ids[link_name])
             for mesh, origin in entries:
                 M = pose @ origin
-                v = mesh.vertices @ M[:3, :3].T + M[:3, 3]
+                v = mesh.vertices @ M[:3, :3].T + M[:3, 3] + right_base
                 ax.plot_trisurf(v[:, 0], v[:, 1], v[:, 2], triangles=mesh.faces, color="tab:blue", alpha=0.6, linewidth=0)
 
         ax.set_xlim(center[0] - radius, center[0] + radius)
