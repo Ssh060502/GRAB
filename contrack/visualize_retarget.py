@@ -112,7 +112,7 @@ def main():
 
     all_pos = np.concatenate([obj_t, right_base[None]])  # include the arm's base so the whole arm stays in frame
     center = all_pos.mean(0)
-    radius = float(np.max(np.linalg.norm(all_pos - center, axis=-1))) + 0.7
+    radius = float(np.max(np.linalg.norm(all_pos - center, axis=-1))) + 0.3
 
     full = np.zeros(robot.dof)
     frames = []
@@ -135,6 +135,8 @@ def main():
         ax.set_xlim(center[0] - radius, center[0] + radius)
         ax.set_ylim(center[1] - radius, center[1] + radius)
         ax.set_zlim(center[2] - radius, center[2] + radius)
+        ax.set_box_aspect((1, 1, 1))  # matplotlib 3D doesn't enforce equal x/y/z scale by default,
+        # which was making the (real, meter-scale) robot mesh look artificially compressed/undersized
         ax.set_title(f"frame {t}/{qpos.shape[0]}")
         fig.canvas.draw()
         frames.append(np.asarray(fig.canvas.buffer_rgba())[..., :3].copy())
