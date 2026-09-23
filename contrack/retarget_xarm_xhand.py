@@ -37,6 +37,17 @@ frame warm-started from the previous one's solution for a smooth trajectory):
   "wrist is fixed, only the finger shape is fit" behaviour confirmed by reading
   dex_retargeting.optimizer.VectorOptimizer.
 
+  Contact-priority override (on by default, --no-contact-priority turns it off): plain vector
+  fitting alone leaves a ~15-40mm gap for some fingers (different finger counts/proportions than
+  a human hand -- an "embodiment gap", not a bug), which is enough that the retargeted fingers
+  may never geometrically reach the object even on frames GRAB itself marks as contact -- and
+  ConTrack's own contact_reward/contact_distance_reward (rewards.py) require the *simulator* to
+  detect a real physical touch, with no partial credit for "close but not touching". So on frames
+  where GRAB says a given finger's distal segment is in contact, the fingertip's target is swapped
+  from the ordinary wrist-to-fingertip vector to GRAB's own recorded contact point on the object's
+  surface instead (see solve_fingers' contact_targets doc) -- a small, targeted push specifically
+  where the data says contact should exist, leaving all non-contact frames unchanged.
+
 Why not call dex_retargeting.optimizer.PositionOptimizer/VectorOptimizer directly: their
 PositionOptimizer only matches a link's own origin, not "a link's origin plus a local offset"
 (needed for the synthetic orientation points), and hand-deriving an analytic Jacobian for that
@@ -120,7 +131,8 @@ def solve_arm(robot, wrist_pos, wrist_rotmat, calib, arm_idx, hand_idx, link_id,
     return res.x
 
 
-def solve_fingers(robot, wrist_pos, wrist_rotmat, calib, tips, finger_idx, origin_id, tip_ids, joint_limits, x0):
+def solve_fingers(robot, wrist_pos, wrist_rotmat, calib, tips, finger_idx, origin_id, tip_ids, joint_limits, x0,
+                   contact_targets=None):
     """One frame of Step 2. Returns the 12 finger joint values.
 
     The isolated hand URDF sits at the world origin with identity orientation, so the vector
@@ -129,9 +141,23 @@ def solve_fingers(robot, wrist_pos, wrist_rotmat, calib, tips, finger_idx, origi
     of the same rotation Step 1 used to place the hand (wrist_rotmat @ calib) before the two are
     comparable -- omitting this was a bug: Step 2's residual used to be identical no matter what
     --calib-rpy was, because calib never reached this function at all.
+
+    contact_targets : (5,3) array or None, in the ("thumb","index","middle","ring","pinky") order.
+        Per finger, either NaN (no override -- use the ordinary wrist-to-fingertip vector target,
+        the default everywhere) or an already-hand-local-frame target vector to use INSTEAD, for
+        frames GRAB itself marks as in contact at that finger's distal segment. That target is
+        built from GRAB's own contact point (a real position on the object's surface where GRAB
+        recorded the finger actually touching), which is a more trustworthy target during contact
+        than the plain MANO-fingertip vector -- the two differ by the same ~2 cm noise floor we
+        measured earlier between MANO's exact fingertip and GRAB's "mean of contact-labelled
+        vertices" point, and it's specifically the contact point, not the fingertip, that we
+        actually want the robot to reach for physical grasping to register in simulation.
     """
     R_hand_world = wrist_rotmat @ calib
     target_vecs = np.stack([R_hand_world.T @ (tips[f] - wrist_pos) for f in ("thumb", "index", "middle", "ring", "pinky")])
+    if contact_targets is not None:
+        use = np.isfinite(contact_targets).all(axis=1)
+        target_vecs[use] = contact_targets[use]
     full = np.zeros(robot.dof)
 
     def residual(x):
@@ -152,6 +178,9 @@ def main():
     ap.add_argument("--assets-dir", required=True, help="ConTrack's assets/ folder (urdf/xarm_xhand_right.urdf, urdf/xhand_right.urdf)")
     ap.add_argument("--calib-rpy", type=float, nargs=3, default=(0.0, 0.0, 0.0),
                     help="correction rotation (deg) applied to the wrist's local axes before matching the arm; see module docstring")
+    ap.add_argument("--no-contact-priority", action="store_true",
+                    help="disable pulling fingertips toward GRAB's own recorded contact points on contact frames "
+                         "(see solve_fingers' contact_targets doc); use only for A/B comparison against the plain vector fit")
     args = ap.parse_args()
 
     from dex_retargeting.robot_wrapper import RobotWrapper
@@ -176,6 +205,32 @@ def main():
         right_base = f["base_translation"][1]  # is_rhand = [0, 1] -> index 1 is the right hand
         wrist_pos_arm_frame = kp["wrist_pos"] - right_base
 
+        # ---- contact-priority targets for Step 2 (see solve_fingers' contact_targets doc) --------
+        FINGERS = ("thumb", "index", "middle", "ring", "pinky")
+        if not args.no_contact_priority:
+            seg_names = [s.decode() for s in f["contacts/segment_names"][:]]
+            is_contact = f["contacts/0/is_contact"][:]      # (T, 2, 15)
+            contact_pts = f["contacts/0/points"][:]          # (T, 2, 15, 3), object-local frame
+            obj_t = f["object_tracks/0/translations"][:]
+            obj_R = R.from_quat(f["object_tracks/0/orientations_xyzw"][:]).as_matrix()
+
+            contact_targets_all = np.full((T, 5, 3), np.nan)
+            for i, name in enumerate(FINGERS):
+                seg = seg_names.index(f"{name}_distal")  # the segment closest to what our tip_ids target
+                touching = is_contact[:, 1, seg].astype(bool)  # right hand
+                if not touching.any():
+                    continue
+                world_pt = np.einsum("tij,tj->ti", obj_R[touching], contact_pts[touching, 1, seg]) + obj_t[touching]
+                R_hand_world_t = np.einsum("tij,jk->tik", kp["wrist_rotmat"][touching], calib)
+                local_vec = np.einsum("tji,tj->ti", R_hand_world_t, world_pt - kp["wrist_pos"][touching])
+                contact_targets_all[touching, i] = local_vec
+            n_used = int(np.isfinite(contact_targets_all).all(axis=2).sum())
+            print(f"contact-priority: {n_used} (frame, finger) pairs will target GRAB's own contact point "
+                  f"instead of the plain fingertip vector")
+        else:
+            contact_targets_all = None
+            print("contact-priority disabled (--no-contact-priority)")
+
         arm_robot = RobotWrapper(os.path.join(args.assets_dir, "urdf", "xarm_xhand_right.urdf"))
         arm_idx = _qpos_indices(arm_robot, XARM_JOINT_NAMES)
         hand_idx_in_arm_robot = _qpos_indices(arm_robot, HAND_JOINT_NAMES)
@@ -197,8 +252,10 @@ def main():
                                arm_idx, hand_idx_in_arm_robot, wrist_link_id, arm_limits, x_arm)
             arm_qpos[t] = x_arm
             tips_t = {k: v[t] for k, v in kp["tips"].items()}
+            ct_t = contact_targets_all[t] if contact_targets_all is not None else None
             x_fin = solve_fingers(hand_robot, kp["wrist_pos"][t], kp["wrist_rotmat"][t], calib,
-                                   tips_t, finger_idx, origin_id, tip_ids, finger_limits, x_fin)
+                                   tips_t, finger_idx, origin_id, tip_ids, finger_limits, x_fin,
+                                   contact_targets=ct_t)
             finger_qpos[t] = x_fin
             if t % 100 == 0:
                 print(f"frame {t}/{T}")
@@ -235,6 +292,8 @@ def main():
             for i, name in enumerate(finger_names):
                 tip_pos = hand_robot.get_link_pose(tip_ids[i])[:3, 3]
                 target_vec = R_hand_world.T @ (kp["tips"][name][t] - kp["wrist_pos"][t])
+                if contact_targets_all is not None and np.isfinite(contact_targets_all[t, i]).all():
+                    target_vec = contact_targets_all[t, i]  # report residual against what was actually solved for
                 finger_err[t, i] = np.linalg.norm((tip_pos - origin_pos) - target_vec)
 
         eps = 1e-3
