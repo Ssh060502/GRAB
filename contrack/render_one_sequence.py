@@ -67,6 +67,13 @@ def main():
     ap.add_argument("--stride", type=int, default=4)
     ap.add_argument("--width", type=int, default=1200)
     ap.add_argument("--height", type=int, default=900)
+    ap.add_argument("--azim", type=float, default=-45,
+                    help="camera azimuth in degrees, rotation around the vertical axis (0=facing +x, "
+                         "90=facing +y, ...). Default -45 matches the original fixed view. Try adding/"
+                         "subtracting 90 at a time to see the object from a different side.")
+    ap.add_argument("--elev", type=float, default=26,
+                    help="camera elevation in degrees above the horizontal plane (0=straight on, 90=top-down)")
+    ap.add_argument("--dist-scale", type=float, default=1.0, help="multiply the auto camera distance (zoom)")
     args = ap.parse_args()
 
     seq_data = parse_npz(os.path.join(args.grab_root, "grab", args.seq + ".npz"))
@@ -100,8 +107,10 @@ def main():
 
     mv = MeshViewer(width=args.width, height=args.height, offscreen=True)
     center = verts_obj.reshape(-1, 3).mean(0)
-    radius = float(np.linalg.norm(verts_obj.reshape(-1, 3) - center, axis=-1).max()) + 0.5
-    eye = center + np.array([radius, -radius, radius * 0.7])
+    radius = (float(np.linalg.norm(verts_obj.reshape(-1, 3) - center, axis=-1).max()) + 0.5) * args.dist_scale
+    azim, elev = np.radians(args.azim), np.radians(args.elev)
+    direction = np.array([np.cos(elev) * np.cos(azim), np.cos(elev) * np.sin(azim), np.sin(elev)])
+    eye = center + radius * direction
     mv.update_camera_pose(lookat_pose(eye, center))
 
     frame_ids = list(range(0, T, args.stride))
