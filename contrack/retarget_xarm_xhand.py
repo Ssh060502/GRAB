@@ -37,16 +37,16 @@ frame warm-started from the previous one's solution for a smooth trajectory):
   "wrist is fixed, only the finger shape is fit" behaviour confirmed by reading
   dex_retargeting.optimizer.VectorOptimizer.
 
-  Contact-priority override (on by default, --no-contact-priority turns it off): plain vector
-  fitting alone leaves a ~15-40mm gap for some fingers (different finger counts/proportions than
-  a human hand -- an "embodiment gap", not a bug), which is enough that the retargeted fingers
-  may never geometrically reach the object even on frames GRAB itself marks as contact -- and
-  ConTrack's own contact_reward/contact_distance_reward (rewards.py) require the *simulator* to
-  detect a real physical touch, with no partial credit for "close but not touching". So on frames
-  where GRAB says a given finger's distal segment is in contact, the fingertip's target is swapped
-  from the ordinary wrist-to-fingertip vector to GRAB's own recorded contact point on the object's
-  surface instead (see solve_fingers' contact_targets doc) -- a small, targeted push specifically
-  where the data says contact should exist, leaving all non-contact frames unchanged.
+  Contact-priority override (OFF by default, opt in with --contact-priority): on frames GRAB marks
+  a finger's distal segment as in contact, swaps that finger's target from the ordinary MANO
+  wrist-to-fingertip vector to GRAB's own recorded contact point on the object's surface instead
+  (see solve_fingers' contact_targets doc). Tried on grab-s1_teapot_pour_1: residual on exactly
+  those contact frames stayed ~25-30mm (0% of frames under 10mm) even after re-fitting calib
+  specifically against this objective (fit_calib.py) -- two independent optimizations converged to
+  nearly the same hand orientation, pointing at a real kinematic limit for this robot/grip rather
+  than something more tuning would fix. Per explicit instruction, default behavior is back to the
+  plain MANO vector for every finger on every frame; this flag is kept available, not deleted, in
+  case it's worth revisiting later (e.g. on a different clip/grip where it might actually help).
 
 Why not call dex_retargeting.optimizer.PositionOptimizer/VectorOptimizer directly: their
 PositionOptimizer only matches a link's own origin, not "a link's origin plus a local offset"
@@ -178,9 +178,12 @@ def main():
     ap.add_argument("--assets-dir", required=True, help="ConTrack's assets/ folder (urdf/xarm_xhand_right.urdf, urdf/xhand_right.urdf)")
     ap.add_argument("--calib-rpy", type=float, nargs=3, default=(0.0, 0.0, 0.0),
                     help="correction rotation (deg) applied to the wrist's local axes before matching the arm; see module docstring")
-    ap.add_argument("--no-contact-priority", action="store_true",
-                    help="disable pulling fingertips toward GRAB's own recorded contact points on contact frames "
-                         "(see solve_fingers' contact_targets doc); use only for A/B comparison against the plain vector fit")
+    ap.add_argument("--contact-priority", action="store_true",
+                    help="opt-in: pull fingertips toward GRAB's own recorded contact points on contact frames, "
+                         "instead of the plain MANO wrist-to-fingertip vector used everywhere by default "
+                         "(see solve_fingers' contact_targets doc). Tried and found not to meaningfully help "
+                         "for this clip/robot (residual stayed ~25-30mm even after re-fitting calib against it) "
+                         "-- off by default, kept available for later.")
     args = ap.parse_args()
 
     from dex_retargeting.robot_wrapper import RobotWrapper
@@ -207,7 +210,7 @@ def main():
 
         # ---- contact-priority targets for Step 2 (see solve_fingers' contact_targets doc) --------
         FINGERS = ("thumb", "index", "middle", "ring", "pinky")
-        if not args.no_contact_priority:
+        if args.contact_priority:
             seg_names = [s.decode() for s in f["contacts/segment_names"][:]]
             is_contact = f["contacts/0/is_contact"][:]      # (T, 2, 15)
             contact_pts = f["contacts/0/points"][:]          # (T, 2, 15, 3), object-local frame
@@ -229,7 +232,7 @@ def main():
                   f"instead of the plain fingertip vector")
         else:
             contact_targets_all = None
-            print("contact-priority disabled (--no-contact-priority)")
+            print("contact-priority off (default): every finger uses the plain MANO wrist-to-fingertip vector")
 
         arm_robot = RobotWrapper(os.path.join(args.assets_dir, "urdf", "xarm_xhand_right.urdf"))
         arm_idx = _qpos_indices(arm_robot, XARM_JOINT_NAMES)

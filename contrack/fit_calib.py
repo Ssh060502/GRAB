@@ -10,30 +10,27 @@ points at direction, not scale (the scale check there shows most fingers' reach 
 GRAB's numbers) -- so the rotation itself is still off, and a proxy heuristic isn't precise enough.
 
 This script instead treats calib as the unknown of an outer optimization whose objective IS
-Step 2's real residual: for a handful of sampled frames, solve the 12 finger joints (reusing
-retarget_xarm_xhand.solve_fingers verbatim) and sum up the leftover fit error; scipy.optimize
-.minimize (Nelder-Mead, gradient-free since the inner IK isn't differentiable end-to-end here)
-searches over the 3 Euler angles to minimize that sum. Slower than estimate_calib.py (each outer
-step re-solves several 12-DOF IK problems) but optimizes the thing we actually care about,
-instead of a stand-in for it. Seed it with estimate_calib.py's answer since it's a reasonable
-starting point even if not precise enough on its own.
+Step 2's real residual: for a handful of frames sampled evenly across the whole clip, solve the
+12 finger joints (reusing retarget_xarm_xhand.solve_fingers verbatim, with the default plain
+wrist-to-fingertip vector target -- no contact_targets override) and sum up the leftover fit
+error; scipy.optimize.minimize (Nelder-Mead, gradient-free since the inner IK isn't
+differentiable end-to-end here) searches over the 3 Euler angles to minimize that sum. Slower
+than estimate_calib.py (each outer step re-solves several 12-DOF IK problems) but optimizes the
+thing we actually care about, instead of a stand-in for it. Seed it with estimate_calib.py's
+answer since it's a reasonable starting point even if not precise enough on its own.
 
-v2: sample frames from the CONTACT-PRIORITY frames specifically (where GRAB records a real
-finger-object touch), and fit against the contact-point target (same swap solve_fingers' own
-contact_targets does), not the plain wrist-to-fingertip vector. Reason: fitting v1 against the
-plain vector gave a calib that, once plugged into retarget_xarm_xhand.py's contact-priority mode,
-still left a stubborn ~25-30mm residual with 0% of contact frames under 10mm and 100% of frames
-pinned at a joint limit -- a sign the earlier calib was optimized for the wrong target (a coarse
-proxy vector) rather than the thing that actually matters for grasping (the literal recorded
-contact point). Re-fitting directly against contact points, for contact frames only, gives calib
-its best shot at finding an overall hand orientation that leaves the fingers enough room to reach
-those specific points, instead of averaging error over hundreds of irrelevant non-contact frames.
+History: this is v1 (plain-vector objective). A v2 variant existed briefly, sampling only
+contact-priority frames and fitting against GRAB's recorded contact points instead of the plain
+vector -- built when retarget_xarm_xhand.py's --contact-priority was the default. That default
+was reverted (per explicit instruction, back to the plain MANO vector for every finger), so this
+script is reverted back to v1 to match: the calib it searches for is the one actually used by the
+current default retargeting method, not a stand-in for a feature that's now off by default.
 
 Runs in the `retarget` env.
 
 Example:
     python contrack/fit_calib.py --h5 out/grab-s1_teapot_pour_1_xhand.h5 \
-        --assets-dir /home/shshao/ConTrack/assets --init-rpy -163.40 -28.35 -145.48
+        --assets-dir /home/shshao/ConTrack/assets --init-rpy -96.21 40.95 -61.16
 """
 
 import argparse
@@ -54,8 +51,7 @@ def main():
     ap.add_argument("--h5", required=True)
     ap.add_argument("--assets-dir", required=True)
     ap.add_argument("--init-rpy", type=float, nargs=3, default=(0.0, 0.0, 0.0))
-    ap.add_argument("--num-frames", type=int, default=20,
-                    help="contact-priority frames sampled evenly for the fit (across all fingers combined)")
+    ap.add_argument("--num-frames", type=int, default=12, help="frames sampled evenly across the clip for the fit")
     args = ap.parse_args()
 
     from dex_retargeting.robot_wrapper import RobotWrapper
@@ -70,52 +66,21 @@ def main():
         k = f["grab_source/keypoints"]
         wrist_pos, wrist_rotmat = k["wrist_pos"][:], k["wrist_rotmat"][:]
         tips = {name: k["tips"][name][:] for name in FINGERS}
-        seg_names = [s.decode() for s in f["contacts/segment_names"][:]]
-        is_contact = f["contacts/0/is_contact"][:]
-        contact_pts = f["contacts/0/points"][:]
-        obj_t = f["object_tracks/0/translations"][:]
-        obj_R = R.from_quat(f["object_tracks/0/orientations_xyzw"][:]).as_matrix()
 
     T = wrist_pos.shape[0]
-
-    def contact_targets_for(calib):
-        """(T,5,3) array, NaN where that finger has no distal contact this frame -- same rule as
-        retarget_xarm_xhand.py's contact-priority block, recomputed here since calib is the
-        unknown being searched over."""
-        out = np.full((T, 5, 3), np.nan)
-        for i, name in enumerate(FINGERS):
-            seg = seg_names.index(f"{name}_distal")
-            touching = is_contact[:, 1, seg].astype(bool)
-            if not touching.any():
-                continue
-            world_pt = np.einsum("tij,tj->ti", obj_R[touching], contact_pts[touching, 1, seg]) + obj_t[touching]
-            R_hand_world_t = np.einsum("tij,jk->tik", wrist_rotmat[touching], calib)
-            out[touching, i] = np.einsum("tji,tj->ti", R_hand_world_t, world_pt - wrist_pos[touching])
-        return out
-
-    # sample frames from wherever contact-priority actually applies (any finger), not evenly across
-    # the whole clip -- non-contact frames don't matter for what we're optimizing here
-    any_contact = np.isfinite(contact_targets_for(np.eye(3))).all(axis=2).any(axis=1)
-    contact_frames = np.where(any_contact)[0]
-    if len(contact_frames) == 0:
-        raise SystemExit("no contact-priority frames at all -- nothing to fit against")
-    sample = contact_frames[np.linspace(0, len(contact_frames) - 1, min(args.num_frames, len(contact_frames))).astype(int)]
-    print(f"fitting against {len(sample)} contact-priority frames: {sample.tolist()}")
+    sample = np.linspace(0, T - 1, args.num_frames).astype(int)
+    print(f"fitting against {len(sample)} sampled frames: {sample.tolist()}")
 
     def total_residual(calib_rpy):
         calib = R.from_euler("xyz", calib_rpy, degrees=True).as_matrix()
-        ct_all = contact_targets_for(calib)
         total = 0.0
         x0 = np.zeros(12)
         for t in sample:
             tips_t = {f: tips[f][t] for f in FINGERS}
-            ct_t = ct_all[t]
             x = solve_fingers(robot, wrist_pos[t], wrist_rotmat[t], calib, tips_t,
-                               finger_idx, origin_id, tip_ids, finger_limits, x0, contact_targets=ct_t)
+                               finger_idx, origin_id, tip_ids, finger_limits, x0)
             R_hand_world = wrist_rotmat[t] @ calib
             target_vecs = np.stack([R_hand_world.T @ (tips_t[f] - wrist_pos[t]) for f in FINGERS])
-            use = np.isfinite(ct_t).all(axis=1)
-            target_vecs[use] = ct_t[use]
             full = np.zeros(robot.dof)
             full[finger_idx] = x
             robot.compute_forward_kinematics(full)
