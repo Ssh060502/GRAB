@@ -81,15 +81,41 @@ def main():
     ])
     robot_dirs /= np.linalg.norm(robot_dirs, axis=1, keepdims=True)
 
-    # ---- human side: wrist-local fingertip directions, averaged over the whole clip ----
+    # ---- human side: wrist-local fingertip directions, averaged over PRE-CONTACT frames only ----
+    # Averaging over the whole clip (the original approach) mixes in frames where the hand is
+    # already curled around the object -- at that point "fingertip direction relative to wrist"
+    # reflects the grasp shape, not the hand's natural open-palm splay, which is the only thing
+    # comparable to the robot's own zero-pose (fingers straight) directions. That mismatch is a
+    # likely contributor to the large, inconsistent per-finger fit errors seen before (thumb 36
+    # deg vs middle/pinky 5.6 deg) -- different fingers curl at different times/amounts during the
+    # grasp, so each one's whole-clip average is distorted differently. Restricting to frames
+    # before GRAB's own first recorded contact keeps the comparison apples-to-apples: hand open,
+    # not yet touching anything, closest to the robot's own fingers-straight reference pose.
     with h5py.File(args.h5, "r") as f:
         k = f["grab_source/keypoints"]
         wrist_pos, wrist_rotmat = k["wrist_pos"][:], k["wrist_rotmat"][:]
         tips = {name: k["tips"][name][:] for name in FINGERS}
+        T = wrist_pos.shape[0]
+
+        is_contact = f["contacts/0/is_contact"][:]  # (T, 2, 15), axis 1: 0=left hand, 1=right hand
+        right_contact_any = is_contact[:, 1, :].any(axis=1)
+        contact_frames = np.flatnonzero(right_contact_any)
+
+    if len(contact_frames) == 0:
+        print(f"no GRAB-labelled contact found for the right hand anywhere in this clip "
+              f"({T} frames) -- using all frames")
+        end = T
+    elif contact_frames[0] < 5:
+        print(f"[warn] GRAB marks contact starting at frame {contact_frames[0]} (very early) -- "
+              f"pre-contact window is short, this fit may still be noisy")
+        end = max(int(contact_frames[0]), 1)
+    else:
+        end = int(contact_frames[0])
+    print(f"using frames [0:{end}] (before first recorded contact) out of {T} total for the human-side fit")
 
     human_dirs = []
     for f in FINGERS:
-        local = np.einsum("tji,tj->ti", wrist_rotmat, tips[f] - wrist_pos)  # wrist_rotmat^T @ vec, per frame
+        local = np.einsum("tji,tj->ti", wrist_rotmat[:end], tips[f][:end] - wrist_pos[:end])
         local /= np.linalg.norm(local, axis=1, keepdims=True)
         human_dirs.append(local.mean(0))
     human_dirs = np.stack(human_dirs)
