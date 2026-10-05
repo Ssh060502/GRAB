@@ -130,13 +130,27 @@ def main():
     # under swapping P/Q), silently handing retarget_xarm_xhand.py a wrist orientation rotated
     # the wrong way -- this is very likely the cause of the robot's wrist visibly pointing the
     # wrong way (e.g. up instead of at the object) despite GRAB's own wrist facing the object.
-    calib = kabsch_rotation_only(robot_dirs, human_dirs)
+    #
+    # Thumb excluded from the fit itself (still reported below): across both whole-clip and
+    # pre-contact-only averaging, thumb's fit error stayed ~35 deg while the other 4 fingers
+    # converged to a consistent ~3-17 deg once restricted to pre-contact frames. A stable
+    # per-finger outlier that doesn't move when the averaging window changes points at a
+    # structural mismatch, not noise: the thumb's CMC joint lets it rotate out of the plane the
+    # other 4 fingers flex in (opposition), and MANO's and this URDF's thumb axis conventions
+    # were designed independently -- there's no reason a single rigid rotation has to reconcile
+    # both at once. Letting the 4 more mutually-consistent fingers define the global orientation,
+    # and leaving the thumb's own 3 joints to do what they can in Step 2's IK, is more honest than
+    # forcing one compromise rotation to also chase the thumb.
+    FIT_FINGERS = ("index", "middle", "ring", "pinky")
+    fit_idx = np.array([FINGERS.index(f) for f in FIT_FINGERS])
+    calib = kabsch_rotation_only(robot_dirs[fit_idx], human_dirs[fit_idx])
     fitted = robot_dirs @ calib.T
     angle_err = np.degrees(np.arccos(np.clip((fitted * human_dirs).sum(1), -1, 1)))
 
-    print("per-finger fit quality (should mostly be well under 30 deg if the coarse assumption holds):")
+    print("per-finger fit quality (thumb reported but NOT used to fit the rotation, see comment above):")
     for f, e in zip(FINGERS, angle_err):
-        print(f"  {f:7s} {e:6.1f} deg")
+        tag = "  (excluded from fit)" if f == "thumb" else ""
+        print(f"  {f:7s} {e:6.1f} deg{tag}")
     rpy = R.from_matrix(calib).as_euler("xyz", degrees=True)
     print(f"\n--calib-rpy {rpy[0]:.2f} {rpy[1]:.2f} {rpy[2]:.2f}")
     print("\nrerun retarget_xarm_xhand.py with the line above and check whether Step 2's")
