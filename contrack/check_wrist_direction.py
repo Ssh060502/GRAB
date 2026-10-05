@@ -62,11 +62,14 @@ def main():
     robot_dirs /= np.linalg.norm(robot_dirs, axis=1, keepdims=True)
     robot_forward_local = robot_dirs.mean(0)
     robot_forward_local /= np.linalg.norm(robot_forward_local)
+    robot_thumb_local = robot.get_link_pose(robot.get_link_index(TIP_LINKS["thumb"]))[:3, 3] - origin_pos
+    robot_thumb_local /= np.linalg.norm(robot_thumb_local)
 
     with h5py.File(args.h5, "r") as f:
         k = f["grab_source/keypoints"]
         wrist_pos, wrist_rotmat = k["wrist_pos"][:], k["wrist_rotmat"][:]
         tips = {name: k["tips"][name][:] for name in FIT_FINGERS}
+        thumb_tip = k["tips"]["thumb"][:]
         obj_t = f["object_tracks/0/translations"][:]  # ConTrack world frame, same as wrist_pos -- no
         # base_translation needed here, we're only comparing two world-frame points/directions,
         # never feeding anything into the arm's own base-relative FK like retarget_xarm_xhand.py does.
@@ -88,6 +91,20 @@ def main():
         human_dirs.append(v)
     human_forward_world = np.mean(human_dirs, axis=0)  # (T,3), world frame, per-frame (finger curl moves this a bit)
     human_forward_world /= np.linalg.norm(human_forward_world, axis=1, keepdims=True)
+    human_thumb_world = thumb_tip - wrist_pos
+    human_thumb_world /= np.linalg.norm(human_thumb_world, axis=1, keepdims=True)
+
+    def signed_angle_around_axis(a, b, axis):
+        """Signed angle (deg) from a to b, measured in the plane perpendicular to axis -- i.e. the
+        ROLL between a and b, with any component of their disagreement ALONG axis projected out
+        first. Positive/negative sign follows the right-hand rule around axis."""
+        a = a - (a @ axis) * axis
+        a /= np.linalg.norm(a)
+        b = b - (b @ axis) * axis
+        b /= np.linalg.norm(b)
+        s = np.cross(a, b) @ axis
+        c = a @ b
+        return np.degrees(np.arctan2(s, c))
 
     sample = np.linspace(0, T - 1, args.num_frames).astype(int)
     print(f"{'frame':>6} {'dist(mm)':>9} {'human_dot':>10} {'robot_dot':>10}  agree?")
@@ -106,6 +123,36 @@ def main():
     print("object (small dist). If robot_dot is negative there while human_dot is positive, the")
     print("fitted hand orientation is pointing away from the object -- i.e. flipped relative to")
     print("the correct one, consistent with 'the hand looks exactly backwards' in the video.")
+
+    # ---- roll check: the ONE rotational DOF the dot-product check above never tested -----------
+    # human_dot/robot_dot above only validate ONE axis of the rotation (how well the "reach
+    # direction" lines up). A full 3D rotation has 2 more DOF beyond that: rotating the whole hand
+    # around that same reach-direction axis (roll -- "palm up" vs "palm down" vs anything in
+    # between) changes nothing about human_dot/robot_dot but completely changes which way
+    # structures rigidly attached near the wrist (e.g. the fixed ee_link/back_link connector
+    # visible in the PyBullet render) end up pointing. The thumb is the only finger NOT in
+    # estimate_calib.py's fit (excluded for being anatomically different, see that script), and
+    # it is also the only one of the 5 that sits off the other 4 fingers' common plane -- which is
+    # exactly what makes it useful here: project both the human and robot thumb directions onto
+    # the plane perpendicular to the (already-validated) reach axis, and compare the angle between
+    # them WITHIN that plane. That isolates roll specifically, instead of mixing it back together
+    # with "thumb's CMC joint just bends differently" the way the raw 43.8 deg angle error from
+    # estimate_calib.py's fit-quality printout does.
+    print("\n=== roll check (uses thumb, excluded from the fit, as an off-plane reference) ===")
+    print(f"{'frame':>6} {'roll error (deg)':>18}")
+    rolls = []
+    for t in sample:
+        target_rot = wrist_rotmat[t] @ calib
+        robot_world_thumb = target_rot @ robot_thumb_local
+        roll = signed_angle_around_axis(human_thumb_world[t], robot_world_thumb, human_forward_world[t])
+        rolls.append(roll)
+        print(f"{t:6d} {roll:18.1f}")
+    print(f"\nmean roll error: {np.mean(rolls):.1f} deg (std {np.std(rolls):.1f} deg across sampled frames)")
+    print("if this is consistently large (and consistent in SIGN across frames, not scattered),")
+    print("that's a real roll offset in --calib-rpy -- rotate calib by roughly this many degrees")
+    print("around the reach-direction axis and recheck. If it scatters with no consistent sign,")
+    print("it's more likely just the thumb's own CMC joint behaving differently frame to frame,")
+    print("not a fixed calib error.")
 
 
 if __name__ == "__main__":
