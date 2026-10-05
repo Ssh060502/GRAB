@@ -65,6 +65,14 @@ def main():
                     help="render a single frame as a PNG, camera close on the object, instead of a full video")
     ap.add_argument("--width", type=int, default=800)
     ap.add_argument("--height", type=int, default=800)
+    ap.add_argument("--azim", type=float, default=-45,
+                    help="camera azimuth in degrees around the vertical axis. Default -45 matches the "
+                         "original fixed view. Try a few values 90 degrees apart to tell a real 3D overlap "
+                         "(stays overlapping from every angle) apart from a camera-projection illusion "
+                         "(separates once you rotate).")
+    ap.add_argument("--elev", type=float, default=23,
+                    help="camera elevation in degrees above the horizontal plane (0=straight on, 90=top-down)")
+    ap.add_argument("--dist-scale", type=float, default=1.0, help="multiply the auto camera distance (zoom)")
     args = ap.parse_args()
 
     with h5py.File(args.h5, "r") as f:
@@ -110,8 +118,11 @@ def main():
             all_pos = np.concatenate([obj_t, right_base[None]])
             center = all_pos.mean(0)
             dist = float(np.max(np.linalg.norm(all_pos - center, axis=-1))) + 0.6
+        dist *= args.dist_scale
 
-        view = p.computeViewMatrix(cameraEyePosition=(center + np.array([dist, -dist, dist * 0.6])).tolist(),
+        azim, elev = np.radians(args.azim), np.radians(args.elev)
+        direction = np.array([np.cos(elev) * np.cos(azim), np.cos(elev) * np.sin(azim), np.sin(elev)])
+        view = p.computeViewMatrix(cameraEyePosition=(center + dist * direction).tolist(),
                                    cameraTargetPosition=center.tolist(), cameraUpVector=[0, 0, 1])
         proj = p.computeProjectionMatrixFOV(fov=45, aspect=args.width / args.height, nearVal=0.01, farVal=10.0)
 
