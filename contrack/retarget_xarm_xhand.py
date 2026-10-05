@@ -110,8 +110,8 @@ def solve_arm(robot, wrist_pos, wrist_rotmat, calib, arm_idx, hand_idx, link_id,
     "target" side of the residual, it cancels out algebraically and the fit always converges to
     rot = wrist_rotmat regardless of calib, silently ignoring --calib-rpy entirely.
     """
-    axis0 = np.array([1.0, 0.0, 0.0])
-    axis1 = np.array([0.0, 1.0, 0.0])
+    axis0 = np.array([1.0, 0.0, 0.0]) #手掌(right_hand_link)自己局部坐标系里的 x 轴方向
+    axis1 = np.array([0.0, 1.0, 0.0]) #手掌(right_hand_link)自己局部坐标系里的 y 轴方向
     target_rot = wrist_rotmat @ calib
     full = np.zeros(robot.dof)
     full[hand_idx] = 0.0
@@ -124,6 +124,7 @@ def solve_arm(robot, wrist_pos, wrist_rotmat, calib, arm_idx, hand_idx, link_id,
         p1 = pos + WRIST_OFFSET_M * (rot @ axis0)
         p2 = pos + WRIST_OFFSET_M * (rot @ axis1)
         target1 = wrist_pos + WRIST_OFFSET_M * (target_rot @ axis0)
+        # rot @ axis0:用机械臂实际算出来的手掌朝向 rot,把这个局部方向转换成"底座系下"的方向
         target2 = wrist_pos + WRIST_OFFSET_M * (target_rot @ axis1)
         return np.concatenate([pos - wrist_pos, p1 - target1, p2 - target2])
 
@@ -153,8 +154,9 @@ def solve_fingers(robot, wrist_pos, wrist_rotmat, calib, tips, finger_idx, origi
         vertices" point, and it's specifically the contact point, not the fingertip, that we
         actually want the robot to reach for physical grasping to register in simulation.
     """
-    R_hand_world = wrist_rotmat @ calib
+    R_hand_world = wrist_rotmat @ calib # ConTrack世界坐标系下手的旋转矩阵
     target_vecs = np.stack([R_hand_world.T @ (tips[f] - wrist_pos) for f in ("thumb", "index", "middle", "ring", "pinky")])
+    # 人手pose，世界 -> 局部(因为乘R.T，如果乘R就是局部 -> 世界)
     if contact_targets is not None:
         use = np.isfinite(contact_targets).all(axis=1)
         target_vecs[use] = contact_targets[use]

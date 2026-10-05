@@ -96,9 +96,17 @@ def main():
     human_dirs /= np.linalg.norm(human_dirs, axis=1, keepdims=True)
 
     # ---- fit ----
-    calib = kabsch_rotation_only(human_dirs, robot_dirs)
-    fitted = human_dirs @ calib.T
-    angle_err = np.degrees(np.arccos(np.clip((fitted * robot_dirs).sum(1), -1, 1)))
+    # retarget_xarm_xhand.py needs calib such that calib.T @ human_dir ~= robot_dir (see
+    # solve_fingers: R_hand_world.T @ (...) = calib.T @ wrist_rotmat.T @ (...)), equivalently
+    # calib @ robot_dir ~= human_dir -- i.e. P=robot_dirs, Q=human_dirs below. Earlier this call
+    # had the arguments swapped (kabsch_rotation_only(human_dirs, robot_dirs)), which gives
+    # exactly the TRANSPOSE of the rotation actually needed (Kabsch fits are transpose-symmetric
+    # under swapping P/Q), silently handing retarget_xarm_xhand.py a wrist orientation rotated
+    # the wrong way -- this is very likely the cause of the robot's wrist visibly pointing the
+    # wrong way (e.g. up instead of at the object) despite GRAB's own wrist facing the object.
+    calib = kabsch_rotation_only(robot_dirs, human_dirs)
+    fitted = robot_dirs @ calib.T
+    angle_err = np.degrees(np.arccos(np.clip((fitted * human_dirs).sum(1), -1, 1)))
 
     print("per-finger fit quality (should mostly be well under 30 deg if the coarse assumption holds):")
     for f, e in zip(FINGERS, angle_err):
