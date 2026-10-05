@@ -8,9 +8,9 @@ points the palm the wrong way?
 Method: for a handful of frames, compute two dot products against the same reference direction
 (wrist -> object center, normalized) and compare them side by side:
   1. human_dot:  GRAB's own MANO hand's "forward" direction (mean reach direction of
-     index/middle/ring/pinky, in the wrist's local frame, rotated into world by wrist_rotmat
-     ALONE -- no calib involved). This MUST be meaningfully positive: it's a plain physical fact
-     that a hand actually grasping an object reaches toward it. This is the trusted baseline.
+     index/middle/ring/pinky from the wrist, computed and kept in WORLD frame throughout -- no
+     calib involved, and no local-frame detour). This MUST be meaningfully positive: it's a plain
+     physical fact that a hand actually grasping an object reaches toward it. Trusted baseline.
   2. robot_dot:  the SAME local "forward" direction (this time the robot's own, from
      estimate_calib.py's robot_dirs, averaged over the same 4 fingers), rotated into world by
      wrist_rotmat @ calib -- i.e. exactly the orientation retarget_xarm_xhand.py's Step 1 asks
@@ -74,15 +74,20 @@ def main():
     T = wrist_pos.shape[0]
     calib = R.from_euler("xyz", args.calib_rpy, degrees=True).as_matrix()
 
-    # human_forward_local: same quantity estimate_calib.py computes as human_dirs, averaged over
-    # the 4 fit fingers -- the MANO hand's own "reach direction" in its own wrist-local frame.
+    # human_forward_world: MANO hand's own "reach direction", kept in WORLD frame throughout (no
+    # local-frame detour) -- directly comparable to `ref` (also world frame) below. An earlier
+    # version of this script rotated the fingertip vectors into the wrist's local frame first
+    # (wrist_rotmat.T @ ...) and then dotted that LOCAL-frame vector against `ref`, a WORLD-frame
+    # vector -- comparing vectors expressed in two different frames, which is not meaningful (this
+    # is exactly the local-vs-world mixing mistake flagged earlier in this conversation, just
+    # reintroduced in a new script). Fixed by never leaving world frame for this comparison.
     human_dirs = []
     for name in FIT_FINGERS:
-        local = np.einsum("tji,tj->ti", wrist_rotmat, tips[name] - wrist_pos)
-        local /= np.linalg.norm(local, axis=1, keepdims=True)
-        human_dirs.append(local)
-    human_forward_local = np.mean(human_dirs, axis=0)  # (T,3), per-frame (finger curl changes this a bit)
-    human_forward_local /= np.linalg.norm(human_forward_local, axis=1, keepdims=True)
+        v = tips[name] - wrist_pos
+        v /= np.linalg.norm(v, axis=1, keepdims=True)
+        human_dirs.append(v)
+    human_forward_world = np.mean(human_dirs, axis=0)  # (T,3), world frame, per-frame (finger curl moves this a bit)
+    human_forward_world /= np.linalg.norm(human_forward_world, axis=1, keepdims=True)
 
     sample = np.linspace(0, T - 1, args.num_frames).astype(int)
     print(f"{'frame':>6} {'dist(mm)':>9} {'human_dot':>10} {'robot_dot':>10}  agree?")
@@ -90,7 +95,7 @@ def main():
         ref = obj_t[t] - wrist_pos[t]
         dist = np.linalg.norm(ref)
         ref /= dist
-        human_dot = float(human_forward_local[t] @ ref)
+        human_dot = float(human_forward_world[t] @ ref)
         target_rot = wrist_rotmat[t] @ calib
         robot_world_forward = target_rot @ robot_forward_local
         robot_dot = float(robot_world_forward @ ref)
