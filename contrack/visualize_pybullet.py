@@ -100,19 +100,6 @@ def main():
     print(f"loaded {urdf_path}: {p.getNumJoints(robot_id)} total joints in URDF, "
           f"{len(joint_idx)} of them are our 19 actuated joints")
 
-    # color every link whose name contains "hand" bright red (xhand_right.urdf's links are all
-    # named right_hand_*, including the wrist origin, the fixed ee/back links, and every finger
-    # link) so the hand is visually unmistakable against the plain-gray xarm7 arm links -- at the
-    # default PyBullet material, both are similar enough shades of gray that it's hard to tell
-    # from a render alone whether an object is touching the hand or the arm's last link.
-    n_hand_links_colored = 0
-    for i in range(p.getNumJoints(robot_id)):
-        link_name = p.getJointInfo(robot_id, i)[12].decode()
-        if "hand" in link_name.lower():
-            p.changeVisualShape(robot_id, i, rgbaColor=[0.9, 0.1, 0.1, 1])
-            n_hand_links_colored += 1
-    print(f"colored {n_hand_links_colored} hand links red (arm links left gray)")
-
     # the object: write its rest mesh to a temp .obj once, PyBullet needs a mesh FILE, not raw arrays
     with tempfile.TemporaryDirectory() as tmp:
         obj_path = os.path.join(tmp, "object.obj")
@@ -131,7 +118,11 @@ def main():
             all_pos = np.concatenate([obj_t, right_base[None]])
             center = all_pos.mean(0)
             dist = float(np.max(np.linalg.norm(all_pos - center, axis=-1))) + 0.6
-        dist *= args.dist_scale
+        # the original fixed camera offset [dist, -dist, dist*0.6] has length dist*1.5362 (not dist
+        # itself, since that vector isn't a unit vector) -- scale here so the default --azim/--elev
+        # (which use a true unit direction vector) reproduce the same camera distance as before,
+        # instead of landing ~35% closer and clipping the arm out of frame.
+        dist *= 1.5362 * args.dist_scale
 
         azim, elev = np.radians(args.azim), np.radians(args.elev)
         direction = np.array([np.cos(elev) * np.cos(azim), np.cos(elev) * np.sin(azim), np.sin(elev)])
