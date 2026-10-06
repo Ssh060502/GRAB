@@ -25,7 +25,10 @@ def main():
     ap.add_argument("--h5", required=True)
     ap.add_argument("--grab-root", required=True)
     ap.add_argument("--model-path", required=True)
-    ap.add_argument("--is-rhand", action="store_true", default=True)
+    side = ap.add_mutually_exclusive_group()
+    side.add_argument("--is-rhand", dest="is_rhand", action="store_true")
+    side.add_argument("--is-lhand", dest="is_rhand", action="store_false")
+    ap.set_defaults(is_rhand=True)
     args = ap.parse_args()
 
     with h5py.File(args.h5, "r+") as f:
@@ -40,6 +43,12 @@ def main():
         k = g.create_group("keypoints")
         k.create_dataset("wrist_pos", data=kp["wrist_pos"])
         k.create_dataset("wrist_rotmat", data=kp["wrist_rotmat"])
+        k.create_dataset("palm_rotmat", data=kp["palm_rotmat"])
+        k.attrs["is_rhand"] = int(args.is_rhand)
+        k.attrs["palm_axes"] = "forward,pinky_to_index,right_handed_normal"
+        m = k.create_group("mcp")
+        for name, arr in kp["mcp"].items():
+            m.create_dataset(name, data=arr)
         t = k.create_group("tips")
         for name, arr in kp["tips"].items():
             t.create_dataset(name, data=arr)

@@ -1,4 +1,4 @@
-"""Compute GRAB hand keypoints (wrist + 5 fingertips) in the ConTrack world frame.
+"""Compute GRAB wrist, MCPs, stable palm frame and tips in ConTrack world.
 
 Validated numerically: fingertip positions computed here for s1/teapot_pour_1 land within
 1.8-2.8 cm of the corresponding GRAB contact-label points already stored in the converted
@@ -26,6 +26,7 @@ import numpy as np
 import smplx
 import torch
 import trimesh
+from palm_geometry import palm_frame
 
 TIP_VERTEX_ID = {"thumb": 744, "index": 320, "middle": 443, "ring": 554, "pinky": 671}
 FINGER_ORDER = ("thumb", "index", "middle", "ring", "pinky")  # canonical order used everywhere below
@@ -55,7 +56,9 @@ def get_hand_keypoints(grab_root, seq, is_rhand, start, end, model_path, Rm, tm)
         wrist_pos    (T,3) float32
         wrist_rotmat (T,3,3) float32   -- GRAB's own wrist rotation (global_orient), rotated by Rm.
                                            NOT verified against the robot's own hand-base axis
-                                           convention -- see retarget_xarm_xhand.py's R_CALIB.
+                                           convention -- legacy --calib-rpy only.
+        palm_rotmat (T,3,3) float32 -- forward/across/normal from wrist and MCPs.
+        mcp          dict name -> (T,3) float32, MCP joint centers in world.
         tips         dict name -> (T,3) float32, name in ("thumb","index","middle","ring","pinky")
     """
     d = np.load(os.path.join(grab_root, "grab", seq + ".npz"), allow_pickle=True)
@@ -65,6 +68,8 @@ def get_hand_keypoints(grab_root, seq, is_rhand, start, end, model_path, Rm, tm)
 
     p = hand["params"]
     T = end - start
+    if start < 0 or end > len(p["global_orient"]) or T <= 0:
+        raise ValueError("Invalid keypoint frame range")
     model = smplx.create(
         model_path, model_type="mano", is_rhand=is_rhand, use_pca=False,
         flat_hand_mean=True, v_template=vtemp, batch_size=T,
@@ -75,6 +80,8 @@ def get_hand_keypoints(grab_root, seq, is_rhand, start, end, model_path, Rm, tm)
         transl=torch.tensor(p["transl"][start:end], dtype=torch.float32),
     )
     joints = out.joints.detach().numpy()    # (T,16,3), GRAB world frame
+    if joints.shape[1] != 16:
+        raise ValueError(f"Expected MANO 16-joint ordering, got {joints.shape}")
     verts = out.vertices.detach().numpy()   # (T,778,3), GRAB world frame
 
     from scipy.spatial.transform import Rotation as R
@@ -82,5 +89,12 @@ def get_hand_keypoints(grab_root, seq, is_rhand, start, end, model_path, Rm, tm)
     wrist_pos = joints[:, 0] @ Rm.T + tm
     wrist_rotmat = Rm[None] @ R.from_rotvec(p["global_orient"][start:end]).as_matrix()
     tips = {name: verts[:, vid] @ Rm.T + tm for name, vid in TIP_VERTEX_ID.items()}
+    # MANO joint order: index 1, middle 4, pinky 7, ring 10, thumb 13.
+    # MCP centers precede their finger rotations in FK and do not curl with tips.
+    mcp = {name: joints[:, idx] @ Rm.T + tm for name, idx in
+           {"index": 1, "middle": 4, "pinky": 7, "ring": 10, "thumb": 13}.items()}
+    palm_rotmat = palm_frame(wrist_pos, mcp["index"], mcp["middle"], mcp["pinky"])
     return {"wrist_pos": wrist_pos.astype(np.float32), "wrist_rotmat": wrist_rotmat.astype(np.float32),
+            "mcp": {k: v.astype(np.float32) for k, v in mcp.items()},
+            "palm_rotmat": palm_rotmat.astype(np.float32),
             "tips": {k: v.astype(np.float32) for k, v in tips.items()}}

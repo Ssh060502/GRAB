@@ -1,73 +1,11 @@
-"""Fill in the qpos of a converted ConTrack clip (xArm7+XHand) via two-step retargeting.
+"""Retarget right XArm7/XHand: stable palm pose -> arm IK -> fixed-wrist fingers.
 
-*** Runs in its OWN conda env, separate from `grab` *** -- pinocchio (pip package `pin`) has no
-wheel for Python 3.9 past version 2.6.18, and dex_retargeting wants numpy>=2.0, which conflicts
-with smplx's MANO loader needing chumpy needing numpy<1.24. So keypoint extraction is a separate
-earlier step (compute_hand_keypoints.py, run in the existing `grab` env) that writes wrist/
-fingertip positions into the h5's grab_source/keypoints group; this script only reads that group
-back -- it never imports smplx/torch/chumpy, so it's free to live in a fresh Python>=3.10 env:
-    conda create -n retarget python=3.11 -y && conda activate retarget
-    pip install dex_retargeting pin scipy h5py
-
-Fills the right arm+hand (the hand that actually touches the object in our clips so far);
-the left arm+hand is held at ConTrack's own resting pose (source/ConTrack/ConTrack/robots/
-xarm_xhand_left.py: DEFAULT_XARM_QPOS, fingers at 0) -- per the earlier decision that an idle,
-non-contacting hand doesn't need to be retargeted for a first pass.
-
-Two independent least-squares fits per frame, both implemented directly with pinocchio
-(via dex_retargeting's small RobotWrapper, used only for URDF loading + forward kinematics --
-none of dex_retargeting's own nlopt-based Optimizer classes are reused, see "why" below) and
-scipy.optimize.least_squares (numerical Jacobian, bounded by the URDF's joint limits, each
-frame warm-started from the previous one's solution for a smooth trajectory):
-
-  Step 1 (arm, "position"-type): places the wrist. The 7 arm joints of xarm_xhand_right.urdf
-  are solved so that 3 points rigidly attached to the wrist match 3 target points: the GRAB
-  wrist position, plus 2 synthetic points offset by 5 cm along the wrist's local x/y axes
-  (constructed from GRAB's own wrist rotation, global_orient). Position alone leaves the arm's
-  orientation about the wrist unconstrained (redundant DOF) -- the 2 extra points pin it down.
-  (The URDF does have 2 extra fixed links right at the wrist, right_hand_ee_link and
-  right_hand_back_link, but both sit at the exact same offset (0,0,-0.065) from right_hand_link,
-  i.e. they coincide and add no orientation information -- confirmed by dumping the URDF's joint
-  origins -- hence the synthetic points instead.)
-
-  Step 2 (fingers, "vector"-type): the 12 finger joints of xhand_right.urdf (hand only, no arm)
-  are solved so that the 5 vectors from the hand's own origin link (right_hand_link) to its 5
-  fingertip links match the 5 corresponding vectors from the GRAB wrist to the GRAB fingertips.
-  This never looks at absolute position, so it is completely decoupled from Step 1 -- exactly the
-  "wrist is fixed, only the finger shape is fit" behaviour confirmed by reading
-  dex_retargeting.optimizer.VectorOptimizer.
-
-  Contact-priority override (OFF by default, opt in with --contact-priority): on frames GRAB marks
-  a finger's distal segment as in contact, swaps that finger's target from the ordinary MANO
-  wrist-to-fingertip vector to GRAB's own recorded contact point on the object's surface instead
-  (see solve_fingers' contact_targets doc). Tried on grab-s1_teapot_pour_1: residual on exactly
-  those contact frames stayed ~25-30mm (0% of frames under 10mm) even after re-fitting calib
-  specifically against this objective (fit_calib.py) -- two independent optimizations converged to
-  nearly the same hand orientation, pointing at a real kinematic limit for this robot/grip rather
-  than something more tuning would fix. Per explicit instruction, default behavior is back to the
-  plain MANO vector for every finger on every frame; this flag is kept available, not deleted, in
-  case it's worth revisiting later (e.g. on a different clip/grip where it might actually help).
-
-Why not call dex_retargeting.optimizer.PositionOptimizer/VectorOptimizer directly: their
-PositionOptimizer only matches a link's own origin, not "a link's origin plus a local offset"
-(needed for the synthetic orientation points), and hand-deriving an analytic Jacobian for that
-case is easy to get subtly wrong. scipy.optimize.least_squares' numerical Jacobian sidesteps
-that at the cost of a bit more compute -- fine at 7-12 unknowns per frame.
-
-*** ONE UNVERIFIED ASSUMPTION (flagged, not hidden) ***
-The mapping between GRAB/MANO's wrist local axes and the robot end-effector's own local axes
-is NOT known to be identity. --calib-rpy lets you apply a fixed correction rotation to the two
-synthetic orientation points; the default (0,0,0) assumes the two frames already line up. This
-can only really be checked by looking at the retargeted motion (Isaac Sim / SAPIEN / the object
-video from inspect_dataset.py) -- if the hand's palm faces the wrong way relative to the object,
-adjust --calib-rpy and rerun Step 1 (Step 2 does not need to change).
-
-Joint/link names and offsets below are read directly from ConTrack's assets/urdf/*.urdf files
-(not guessed): xarm_xhand_right.urdf, xhand_right.urdf.
-
-Example (after running compute_hand_keypoints.py in the `grab` env):
-    python contrack/retarget_xarm_xhand.py \
-        --h5 out/grab-s1_teapot_pour_1.h5 --assets-dir /path/to/ConTrack/assets
+Default palm mode requires freshly extracted MCP/palm keypoints. Robot palm axes
+come from fixed MCP pivots in the URDF. Explicit offset is in human palm axes (m).
+Legacy MANO root rotation mode remains available with --wrist-mode mano.
+Finger targets are transformed using the actual arm FK wrist, and diagnostics
+measure world-space fingertip error against the targets used for optimization.
+Assumes the robot base has identity rotation in ConTrack world.
 """
 
 import argparse
@@ -77,6 +15,7 @@ import h5py
 import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation as R
+from palm_geometry import robot_palm_frame, wrist_targets
 
 # xarm_xhand_left.py / xarm_xhand_right.py (ConTrack robots module)
 XARM_JOINT_NAMES = [f"joint{i}" for i in range(1, 8)]
@@ -94,7 +33,7 @@ TIP_LINKS = {  # xhand_right.urdf fingertip links; NB "mid" not "middle" in the 
     "thumb": "right_hand_thumb_rota_tip", "index": "right_hand_index_rota_tip",
     "middle": "right_hand_mid_tip", "ring": "right_hand_ring_tip", "pinky": "right_hand_pinky_tip",
 }
-WRIST_OFFSET_M = 0.05  # size of the 2 synthetic orientation-pinning points, in meters
+WRIST_OFFSET_M = 0.05  # orientation residual scale, meters per radian
 
 
 def _qpos_indices(robot, joint_names):
@@ -102,16 +41,7 @@ def _qpos_indices(robot, joint_names):
 
 
 def solve_arm(robot, wrist_pos, wrist_rotmat, calib, arm_idx, hand_idx, link_id, joint_limits, x0):
-    """One frame of Step 1. Returns the 7 arm joint values.
-
-    axis0/axis1 must be FIXED reference directions, not derived from calib: calib belongs only on
-    the target side (the desired world orientation is wrist_rotmat @ calib). Using calib's own
-    columns as axis0/axis1 was a bug -- since the same axis then appears on both the "robot" and
-    "target" side of the residual, it cancels out algebraically and the fit always converges to
-    rot = wrist_rotmat regardless of calib, silently ignoring --calib-rpy entirely.
-    """
-    axis0 = np.array([1.0, 0.0, 0.0]) #手掌(right_hand_link)自己局部坐标系里的 x 轴方向
-    axis1 = np.array([0.0, 1.0, 0.0]) #手掌(right_hand_link)自己局部坐标系里的 y 轴方向
+    """Match position and SO(3) orientation separately; calib right-multiplies."""
     target_rot = wrist_rotmat @ calib
     full = np.zeros(robot.dof)
     full[hand_idx] = 0.0
@@ -121,12 +51,8 @@ def solve_arm(robot, wrist_pos, wrist_rotmat, calib, arm_idx, hand_idx, link_id,
         robot.compute_forward_kinematics(full)
         pose = robot.get_link_pose(link_id)
         pos, rot = pose[:3, 3], pose[:3, :3]
-        p1 = pos + WRIST_OFFSET_M * (rot @ axis0)
-        p2 = pos + WRIST_OFFSET_M * (rot @ axis1)
-        target1 = wrist_pos + WRIST_OFFSET_M * (target_rot @ axis0)
-        # rot @ axis0:用机械臂实际算出来的手掌朝向 rot,把这个局部方向转换成"底座系下"的方向
-        target2 = wrist_pos + WRIST_OFFSET_M * (target_rot @ axis1)
-        return np.concatenate([pos - wrist_pos, p1 - target1, p2 - target2])
+        rotation_error = R.from_matrix(target_rot.T @ rot).as_rotvec()
+        return np.concatenate([pos - wrist_pos, WRIST_OFFSET_M * rotation_error])
 
     res = least_squares(residual, x0, bounds=joint_limits.T, method="trf", xtol=1e-10, ftol=1e-10)
     return res.x
@@ -134,39 +60,24 @@ def solve_arm(robot, wrist_pos, wrist_rotmat, calib, arm_idx, hand_idx, link_id,
 
 def solve_fingers(robot, wrist_pos, wrist_rotmat, calib, tips, finger_idx, origin_id, tip_ids, joint_limits, x0,
                    contact_targets=None):
-    """One frame of Step 2. Returns the 12 finger joint values.
+    """Fit world targets relative to the actual fixed wrist pose.
 
-    The isolated hand URDF sits at the world origin with identity orientation, so the vector
-    it computes (tip - origin) via forward kinematics is expressed in the hand's OWN local frame.
-    GRAB's wrist-to-fingertip vector is in world frame, so it must be rotated back by the inverse
-    of the same rotation Step 1 used to place the hand (wrist_rotmat @ calib) before the two are
-    comparable -- omitting this was a bug: Step 2's residual used to be identical no matter what
-    --calib-rpy was, because calib never reached this function at all.
-
-    contact_targets : (5,3) array or None, in the ("thumb","index","middle","ring","pinky") order.
-        Per finger, either NaN (no override -- use the ordinary wrist-to-fingertip vector target,
-        the default everywhere) or an already-hand-local-frame target vector to use INSTEAD, for
-        frames GRAB itself marks as in contact at that finger's distal segment. That target is
-        built from GRAB's own contact point (a real position on the object's surface where GRAB
-        recorded the finger actually touching), which is a more trustworthy target during contact
-        than the plain MANO-fingertip vector -- the two differ by the same ~2 cm noise floor we
-        measured earlier between MANO's exact fingertip and GRAB's "mean of contact-labelled
-        vertices" point, and it's specifically the contact point, not the fingertip, that we
-        actually want the robot to reach for physical grasping to register in simulation.
+    contact_targets, when present, are world positions, NaN for no override.
+    wrist_rotmat @ calib is the actual wrist orientation from arm FK.
     """
-    R_hand_world = wrist_rotmat @ calib # ConTrack世界坐标系下手的旋转矩阵
-    target_vecs = np.stack([R_hand_world.T @ (tips[f] - wrist_pos) for f in ("thumb", "index", "middle", "ring", "pinky")])
-    # 人手pose，世界 -> 局部(因为乘R.T，如果乘R就是局部 -> 世界)
+    R_hand_world = wrist_rotmat @ calib
+    target_points = np.stack([tips[f] for f in ("thumb", "index", "middle", "ring", "pinky")])
+    target_vecs = (target_points - wrist_pos) @ R_hand_world
     if contact_targets is not None:
         use = np.isfinite(contact_targets).all(axis=1)
-        target_vecs[use] = contact_targets[use]
+        target_vecs[use] = (contact_targets[use] - wrist_pos) @ R_hand_world
     full = np.zeros(robot.dof)
 
     def residual(x):
         full[finger_idx] = x
         robot.compute_forward_kinematics(full)
-        origin_pos = robot.get_link_pose(origin_id)[:3, 3]
-        vecs = np.stack([robot.get_link_pose(i)[:3, 3] - origin_pos for i in tip_ids])
+        origin = robot.get_link_pose(origin_id)
+        vecs = np.stack([origin[:3, :3].T @ (robot.get_link_pose(i)[:3, 3] - origin[:3, 3]) for i in tip_ids])
         return (vecs - target_vecs).ravel()
 
     res = least_squares(residual, x0, bounds=joint_limits.T, method="trf", xtol=1e-10, ftol=1e-10)
@@ -186,7 +97,14 @@ def main():
                          "(see solve_fingers' contact_targets doc). Tried and found not to meaningfully help "
                          "for this clip/robot (residual stayed ~25-30mm even after re-fitting calib against it) "
                          "-- off by default, kept available for later.")
+    ap.add_argument("--wrist-mode", choices=("palm", "mano"), default="palm")
+    ap.add_argument("--wrist-offset-palm", type=float, nargs=3, default=(0., 0., 0.),
+                    help="robot origin minus MANO wrist in stable palm axes, meters")
     args = ap.parse_args()
+    if args.wrist_mode == "palm" and any(args.calib_rpy):
+        ap.error("--calib-rpy is only used with --wrist-mode mano")
+    if args.wrist_mode == "mano" and any(args.wrist_offset_palm):
+        ap.error("--wrist-offset-palm requires --wrist-mode palm")
 
     from dex_retargeting.robot_wrapper import RobotWrapper
 
@@ -197,8 +115,21 @@ def main():
         kp_grp = g["keypoints"]
         kp = {"wrist_pos": kp_grp["wrist_pos"][:], "wrist_rotmat": kp_grp["wrist_rotmat"][:],
               "tips": {name: kp_grp["tips"][name][:] for name in kp_grp["tips"]}}
+        if not kp_grp.attrs.get("is_rhand", 1):
+            raise SystemExit("Right-arm retargeting requires right-hand keypoints")
         T = kp["wrist_pos"].shape[0]
-        calib = R.from_euler("xyz", args.calib_rpy, degrees=True).as_matrix()
+        if args.wrist_mode == "palm":
+            if "palm_rotmat" not in kp_grp:
+                raise SystemExit("Missing palm geometry: rerun compute_hand_keypoints.py")
+            hand_urdf = os.path.join(args.assets_dir, "urdf", "xhand_right.urdf")
+            basis, _ = robot_palm_frame(RobotWrapper(hand_urdf), hand_urdf)
+            wrist_target_pos, wrist_target_rot = wrist_targets(
+                kp["wrist_pos"], kp_grp["palm_rotmat"][:], basis, args.wrist_offset_palm)
+        else:
+            wrist_target_pos = kp["wrist_pos"]
+            wrist_target_rot = kp["wrist_rotmat"] @ R.from_euler("xyz", args.calib_rpy, degrees=True).as_matrix()
+        actual_pos = np.zeros((T, 3))
+        actual_rot = np.zeros((T, 3, 3))
 
         # ConTrack spawns xarm_xhand_right's own root (link_base) at base_translation in the world
         # (confirmed by reading xarm_xhand_env_cfg.py's init_state=...pos=base_translation), but
@@ -208,7 +139,7 @@ def main():
         # wrist target before matching it against arm FK output. Step 2 does not need this: its
         # vectors (tip - wrist) are unaffected by adding/subtracting the same constant to both ends.
         right_base = f["base_translation"][1]  # is_rhand = [0, 1] -> index 1 is the right hand
-        wrist_pos_arm_frame = kp["wrist_pos"] - right_base
+        wrist_pos_arm_frame = wrist_target_pos - right_base
 
         # ---- contact-priority targets for Step 2 (see solve_fingers' contact_targets doc) --------
         FINGERS = ("thumb", "index", "middle", "ring", "pinky")
@@ -226,9 +157,7 @@ def main():
                 if not touching.any():
                     continue
                 world_pt = np.einsum("tij,tj->ti", obj_R[touching], contact_pts[touching, 1, seg]) + obj_t[touching]
-                R_hand_world_t = np.einsum("tij,jk->tik", kp["wrist_rotmat"][touching], calib)
-                local_vec = np.einsum("tji,tj->ti", R_hand_world_t, world_pt - kp["wrist_pos"][touching])
-                contact_targets_all[touching, i] = local_vec
+                contact_targets_all[touching, i] = world_pt
             n_used = int(np.isfinite(contact_targets_all).all(axis=2).sum())
             print(f"contact-priority: {n_used} (frame, finger) pairs will target GRAB's own contact point "
                   f"instead of the plain fingertip vector")
@@ -253,12 +182,18 @@ def main():
         x_arm = np.clip(np.zeros(7), arm_limits[:, 0], arm_limits[:, 1])
         x_fin = np.clip(np.zeros(12), finger_limits[:, 0], finger_limits[:, 1])
         for t in range(T):
-            x_arm = solve_arm(arm_robot, wrist_pos_arm_frame[t], kp["wrist_rotmat"][t], calib,
+            x_arm = solve_arm(arm_robot, wrist_pos_arm_frame[t], wrist_target_rot[t], np.eye(3),
                                arm_idx, hand_idx_in_arm_robot, wrist_link_id, arm_limits, x_arm)
             arm_qpos[t] = x_arm
+            arm_full = np.zeros(arm_robot.dof)
+            arm_full[arm_idx] = x_arm
+            arm_robot.compute_forward_kinematics(arm_full)
+            achieved = arm_robot.get_link_pose(wrist_link_id)
+            actual_pos[t] = achieved[:3, 3] + right_base
+            actual_rot[t] = achieved[:3, :3]
             tips_t = {k: v[t] for k, v in kp["tips"].items()}
             ct_t = contact_targets_all[t] if contact_targets_all is not None else None
-            x_fin = solve_fingers(hand_robot, kp["wrist_pos"][t], kp["wrist_rotmat"][t], calib,
+            x_fin = solve_fingers(hand_robot, actual_pos[t], actual_rot[t], np.eye(3),
                                    tips_t, finger_idx, origin_id, tip_ids, finger_limits, x_fin,
                                    contact_targets=ct_t)
             finger_qpos[t] = x_fin
@@ -274,6 +209,18 @@ def main():
         f.create_dataset("qpos", data=qpos)
         f.attrs["qpos_is_placeholder"] = 0
         f.attrs["retarget_calib_rpy_deg"] = args.calib_rpy
+        f.attrs["retarget_wrist_mode"] = args.wrist_mode
+        f.attrs["retarget_wrist_offset_palm_m"] = args.wrist_offset_palm
+        if "grab_source/wrist_targets" in f:
+            del f["grab_source/wrist_targets"]
+        target_group = f.create_group("grab_source/wrist_targets")
+        target_group.attrs["method"] = args.wrist_mode
+        target_group.attrs["wrist_offset_palm_m"] = args.wrist_offset_palm
+        if args.wrist_mode == "palm":
+            target_group.create_dataset("robot_palm_basis", data=basis)
+        for name, arr in (("positions", wrist_target_pos), ("rotations", wrist_target_rot),
+                          ("actual_positions", actual_pos), ("actual_rotations", actual_rot)):
+            target_group.create_dataset(name, data=arr)
 
         # ---- diagnostics over ALL frames (no Isaac Sim needed) ------------------------------
         pos_err = np.zeros(T)
@@ -287,31 +234,31 @@ def main():
             arm_robot.compute_forward_kinematics(full_arm)
             pose = arm_robot.get_link_pose(wrist_link_id)
             pos_err[t] = np.linalg.norm(pose[:3, 3] - wrist_pos_arm_frame[t])
-            target_rot = kp["wrist_rotmat"][t] @ calib
+            target_rot = wrist_target_rot[t]
             rot_err_deg[t] = R.from_matrix(pose[:3, :3].T @ target_rot).magnitude() * 180 / np.pi
 
             full_hand[finger_idx] = finger_qpos[t]
             hand_robot.compute_forward_kinematics(full_hand)
-            origin_pos = hand_robot.get_link_pose(origin_id)[:3, 3]
-            R_hand_world = kp["wrist_rotmat"][t] @ calib
+            origin = hand_robot.get_link_pose(origin_id)
             for i, name in enumerate(finger_names):
                 tip_pos = hand_robot.get_link_pose(tip_ids[i])[:3, 3]
-                target_vec = R_hand_world.T @ (kp["tips"][name][t] - kp["wrist_pos"][t])
+                tip_local = origin[:3, :3].T @ (tip_pos - origin[:3, 3])
+                tip_world = actual_pos[t] + actual_rot[t] @ tip_local
+                target = kp["tips"][name][t]
                 if contact_targets_all is not None and np.isfinite(contact_targets_all[t, i]).all():
-                    target_vec = contact_targets_all[t, i]  # report residual against what was actually solved for
-                finger_err[t, i] = np.linalg.norm((tip_pos - origin_pos) - target_vec)
+                    target = contact_targets_all[t, i]
+                finger_err[t, i] = np.linalg.norm(tip_world - target)
 
         eps = 1e-3
         arm_sat = np.mean(np.any((arm_qpos - arm_limits[:, 0] < eps) | (arm_limits[:, 1] - arm_qpos < eps), axis=1))
         fin_sat = np.mean(np.any((finger_qpos - finger_limits[:, 0] < eps) | (finger_limits[:, 1] - finger_qpos < eps), axis=1))
 
-        # ---- scale check: is the human target even within the robot's *physical* reach? ---------
+        # ---- sampled reach diagnostic (not a rigorous workspace bound) ----
         # For each finger, bracket the robot's own achievable tip-to-origin distance by evaluating
         # that finger's 2 joints at {lower limit, 0, upper limit} (other joints held at 0), and
         # compare against the human vector length actually being asked for (mean/min/max over the
-        # whole clip). If the human numbers fall outside the robot bracket, no calibration rotation
-        # can ever fix Step 2 -- the two hands are simply not compatible sizes for this finger.
-        print("\n=== scale check: human wrist-to-fingertip distance vs robot's own physical reach (mm) ===")
+        # whole clip). This sample does not prove feasibility or infeasibility.
+        print("\n=== scale check: human wrist-to-fingertip distance vs robot's sampled reach (mm) ===")
         import itertools
         finger_joints = {
             "thumb": ("right_hand_thumb_bend_joint", "right_hand_thumb_rota_joint1", "right_hand_thumb_rota_joint2"),
@@ -338,9 +285,9 @@ def main():
 
         print("\n=== Step 1 (arm, position): wrist match over all frames ===")
         print(f"  position error   mean {pos_err.mean()*1000:.2f} mm   max {pos_err.max()*1000:.2f} mm")
-        print(f"  orientation error mean {rot_err_deg.mean():.2f} deg  max {rot_err_deg.max():.2f} deg  (large mean here usually means --calib-rpy is wrong)")
+        print(f"  orientation error mean {rot_err_deg.mean():.2f} deg  max {rot_err_deg.max():.2f} deg  (IK tracking error; does not validate anatomical calibration)")
         print(f"  frames with an arm joint at its limit: {arm_sat*100:.1f}%")
-        print("=== Step 2 (fingers, vector): per-finger fit residual (mm), ALL frames (mixes plain-vector and contact-point targets) ===")
+        print("=== Step 2 (fingers, vector): per-finger WORLD position residual (mm), ALL frames (mixes plain-vector and contact-point targets) ===")
         for i, name in enumerate(finger_names):
             print(f"  {name:7s} mean {finger_err[:, i].mean()*1000:6.2f}  max {finger_err[:, i].max()*1000:6.2f}")
         print(f"  frames with a finger joint at its limit: {fin_sat*100:.1f}%")
