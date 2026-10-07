@@ -76,7 +76,7 @@ class PalmGeometryTests(unittest.TestCase):
             return SimpleNamespace(x=x0)
         namespace = {'np': np, 'least_squares': optimizer}
         exec(compile(ast.Module(body=[fn], type_ignores=[]), '<solver>', 'exec'), namespace)
-        namespace['solve_fingers'](robot, wrist, wrist_rot, np.eye(3), targets,
+        namespace['solve_fingers'](robot, wrist, wrist_rot, targets,
                                    [0], 0, [1, 2, 3, 4, 5], np.array([[-1., 1.]]),
                                    np.zeros(1), contact_targets=contact)
 

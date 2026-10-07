@@ -1,8 +1,7 @@
 """Retarget right XArm7/XHand: stable palm pose -> arm IK -> fixed-wrist fingers.
 
-Default palm mode requires freshly extracted MCP/palm keypoints. Robot palm axes
+Palm geometry requires freshly extracted MCP/palm keypoints. Robot palm axes
 come from fixed MCP pivots in the URDF. Explicit offset is in human palm axes (m).
-Legacy MANO root rotation mode remains available with --wrist-mode mano.
 Finger targets are transformed using the actual arm FK wrist, and diagnostics
 measure world-space fingertip error against the targets used for optimization.
 Assumes the robot base has identity rotation in ConTrack world.
@@ -40,9 +39,8 @@ def _qpos_indices(robot, joint_names):
     return np.array([robot.get_joint_index(n) for n in joint_names])
 
 
-def solve_arm(robot, wrist_pos, wrist_rotmat, calib, arm_idx, hand_idx, link_id, joint_limits, x0):
-    """Match position and SO(3) orientation separately; calib right-multiplies."""
-    target_rot = wrist_rotmat @ calib
+def solve_arm(robot, wrist_pos, target_rot, arm_idx, hand_idx, link_id, joint_limits, x0):
+    """Match the supplied wrist position and orientation in the robot base frame."""
     full = np.zeros(robot.dof)
     full[hand_idx] = 0.0
 
@@ -58,14 +56,14 @@ def solve_arm(robot, wrist_pos, wrist_rotmat, calib, arm_idx, hand_idx, link_id,
     return res.x
 
 
-def solve_fingers(robot, wrist_pos, wrist_rotmat, calib, tips, finger_idx, origin_id, tip_ids, joint_limits, x0,
+def solve_fingers(robot, wrist_pos, wrist_rotmat, tips, finger_idx, origin_id, tip_ids, joint_limits, x0,
                    contact_targets=None):
     """Fit world targets relative to the actual fixed wrist pose.
 
     contact_targets, when present, are world positions, NaN for no override.
-    wrist_rotmat @ calib is the actual wrist orientation from arm FK.
+    wrist_rotmat is the actual wrist orientation from arm FK.
     """
-    R_hand_world = wrist_rotmat @ calib
+    R_hand_world = wrist_rotmat
     target_points = np.stack([tips[f] for f in ("thumb", "index", "middle", "ring", "pinky")])
     target_vecs = (target_points - wrist_pos) @ R_hand_world
     if contact_targets is not None:
@@ -89,23 +87,11 @@ def main():
     ap.add_argument("--h5", required=True,
                     help="the file produced by grab_to_contrack.py + compute_hand_keypoints.py; qpos is filled in place")
     ap.add_argument("--assets-dir", required=True, help="ConTrack's assets/ folder (urdf/xarm_xhand_right.urdf, urdf/xhand_right.urdf)")
-    ap.add_argument("--calib-rpy", type=float, nargs=3, default=(0.0, 0.0, 0.0),
-                    help="correction rotation (deg) applied to the wrist's local axes before matching the arm; see module docstring")
     ap.add_argument("--contact-priority", action="store_true",
-                    help="opt-in: pull fingertips toward GRAB's own recorded contact points on contact frames, "
-                         "instead of the plain MANO wrist-to-fingertip vector used everywhere by default "
-                         "(see solve_fingers' contact_targets doc). Tried and found not to meaningfully help "
-                         "for this clip/robot (residual stayed ~25-30mm even after re-fitting calib against it) "
-                         "-- off by default, kept available for later.")
-    ap.add_argument("--wrist-mode", choices=("palm", "mano"), default="palm")
+                    help="on contact frames, use GRAB distal contact world positions as fingertip targets")
     ap.add_argument("--wrist-offset-palm", type=float, nargs=3, default=(0., 0., 0.),
                     help="robot origin minus MANO wrist in stable palm axes, meters")
     args = ap.parse_args()
-    if args.wrist_mode == "palm" and any(args.calib_rpy):
-        ap.error("--calib-rpy is only used with --wrist-mode mano")
-    if args.wrist_mode == "mano" and any(args.wrist_offset_palm):
-        ap.error("--wrist-offset-palm requires --wrist-mode palm")
-
     from dex_retargeting.robot_wrapper import RobotWrapper
 
     with h5py.File(args.h5, "r+") as f:
@@ -113,21 +99,17 @@ def main():
         if "keypoints" not in g:
             raise SystemExit("no grab_source/keypoints group -- run compute_hand_keypoints.py first (in the `grab` env)")
         kp_grp = g["keypoints"]
-        kp = {"wrist_pos": kp_grp["wrist_pos"][:], "wrist_rotmat": kp_grp["wrist_rotmat"][:],
+        kp = {"wrist_pos": kp_grp["wrist_pos"][:],
               "tips": {name: kp_grp["tips"][name][:] for name in kp_grp["tips"]}}
         if not kp_grp.attrs.get("is_rhand", 1):
             raise SystemExit("Right-arm retargeting requires right-hand keypoints")
         T = kp["wrist_pos"].shape[0]
-        if args.wrist_mode == "palm":
-            if "palm_rotmat" not in kp_grp:
-                raise SystemExit("Missing palm geometry: rerun compute_hand_keypoints.py")
-            hand_urdf = os.path.join(args.assets_dir, "urdf", "xhand_right.urdf")
-            basis, _ = robot_palm_frame(RobotWrapper(hand_urdf), hand_urdf)
-            wrist_target_pos, wrist_target_rot = wrist_targets(
-                kp["wrist_pos"], kp_grp["palm_rotmat"][:], basis, args.wrist_offset_palm)
-        else:
-            wrist_target_pos = kp["wrist_pos"]
-            wrist_target_rot = kp["wrist_rotmat"] @ R.from_euler("xyz", args.calib_rpy, degrees=True).as_matrix()
+        if "palm_rotmat" not in kp_grp:
+            raise SystemExit("Missing palm geometry: rerun compute_hand_keypoints.py")
+        hand_urdf = os.path.join(args.assets_dir, "urdf", "xhand_right.urdf")
+        basis, _ = robot_palm_frame(RobotWrapper(hand_urdf), hand_urdf)
+        wrist_target_pos, wrist_target_rot = wrist_targets(
+            kp["wrist_pos"], kp_grp["palm_rotmat"][:], basis, args.wrist_offset_palm)
         actual_pos = np.zeros((T, 3))
         actual_rot = np.zeros((T, 3, 3))
 
@@ -182,7 +164,7 @@ def main():
         x_arm = np.clip(np.zeros(7), arm_limits[:, 0], arm_limits[:, 1])
         x_fin = np.clip(np.zeros(12), finger_limits[:, 0], finger_limits[:, 1])
         for t in range(T):
-            x_arm = solve_arm(arm_robot, wrist_pos_arm_frame[t], wrist_target_rot[t], np.eye(3),
+            x_arm = solve_arm(arm_robot, wrist_pos_arm_frame[t], wrist_target_rot[t],
                                arm_idx, hand_idx_in_arm_robot, wrist_link_id, arm_limits, x_arm)
             arm_qpos[t] = x_arm
             arm_full = np.zeros(arm_robot.dof)
@@ -193,7 +175,7 @@ def main():
             actual_rot[t] = achieved[:3, :3]
             tips_t = {k: v[t] for k, v in kp["tips"].items()}
             ct_t = contact_targets_all[t] if contact_targets_all is not None else None
-            x_fin = solve_fingers(hand_robot, actual_pos[t], actual_rot[t], np.eye(3),
+            x_fin = solve_fingers(hand_robot, actual_pos[t], actual_rot[t],
                                    tips_t, finger_idx, origin_id, tip_ids, finger_limits, x_fin,
                                    contact_targets=ct_t)
             finger_qpos[t] = x_fin
@@ -208,16 +190,18 @@ def main():
         del f["qpos"]
         f.create_dataset("qpos", data=qpos)
         f.attrs["qpos_is_placeholder"] = 0
-        f.attrs["retarget_calib_rpy_deg"] = args.calib_rpy
-        f.attrs["retarget_wrist_mode"] = args.wrist_mode
+        # Remove obsolete metadata when rewriting an older output file.
+        for obsolete in ("retarget_calib_rpy_deg", "retarget_wrist_mode"):
+            if obsolete in f.attrs:
+                del f.attrs[obsolete]
+        f.attrs["retarget_method"] = "wrist_mcp_palm"
         f.attrs["retarget_wrist_offset_palm_m"] = args.wrist_offset_palm
         if "grab_source/wrist_targets" in f:
             del f["grab_source/wrist_targets"]
         target_group = f.create_group("grab_source/wrist_targets")
-        target_group.attrs["method"] = args.wrist_mode
+        target_group.attrs["method"] = "wrist_mcp_palm"
         target_group.attrs["wrist_offset_palm_m"] = args.wrist_offset_palm
-        if args.wrist_mode == "palm":
-            target_group.create_dataset("robot_palm_basis", data=basis)
+        target_group.create_dataset("robot_palm_basis", data=basis)
         for name, arr in (("positions", wrist_target_pos), ("rotations", wrist_target_rot),
                           ("actual_positions", actual_pos), ("actual_rotations", actual_rot)):
             target_group.create_dataset(name, data=arr)

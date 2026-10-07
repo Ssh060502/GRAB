@@ -12,8 +12,8 @@ python contrack/check_wrist_direction.py --h5 out/clip.h5 --assets-dir /path/to/
 ```
 
 `estimate_calib.py` is an inspection step; retargeting also computes the palm
-mapping itself, so it does not require saved calibration targets. It prints a
-legacy RPY equivalent for comparison, not a parameter needed in default palm mode.
+mapping itself, so it does not require saved wrist targets. It reports mapping
+stability; retargeting uses only the MCP palm geometry path.
 
 The human palm basis has columns:
 
@@ -67,9 +67,8 @@ that the chosen URDF landmarks match the physical anatomy. Actual FK errors
 measure the arm's ability to track the target. Finger diagnostics now report
 world position errors, including the arm's remaining tracking error.
 
-Legacy root-rotation mapping is available with `--wrist-mode mano --calib-rpy X Y Z`.
-The previous direction-checker's `--calib-rpy` option has been replaced by checks
-of saved wrist targets and actual FK. No Sharpa IK implementation is added here.
+The direction checker uses saved wrist targets and actual FK.
+No Sharpa IK implementation is added here.
 
 Dependency-light regression checks:
 

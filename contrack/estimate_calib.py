@@ -37,9 +37,7 @@ def main():
         print("Robot MCP anchors in right_hand_link (m):", anchors)
         print("MANO-local correction variation: mean %.4f deg, max %.4f deg" %
               (spread.mean(), spread.max()))
-        rpy = mean.as_euler("xyz", degrees=True)
-        print("Legacy equivalent --calib-rpy %.6f %.6f %.6f" % tuple(rpy))
-        print("Use retarget_xarm_xhand.py --wrist-mode palm (default).")
+        print("Use retarget_xarm_xhand.py to solve arm and finger joints.")
         print("Offset in palm axes (m):", args.wrist_offset_palm)
         if args.write_targets:
             if "grab_source/wrist_targets" in f:

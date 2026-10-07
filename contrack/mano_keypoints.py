@@ -56,7 +56,7 @@ def get_hand_keypoints(grab_root, seq, is_rhand, start, end, model_path, Rm, tm)
         wrist_pos    (T,3) float32
         wrist_rotmat (T,3,3) float32   -- GRAB's own wrist rotation (global_orient), rotated by Rm.
                                            NOT verified against the robot's own hand-base axis
-                                           convention -- legacy --calib-rpy only.
+                                           convention; retained for palm mapping stability diagnostics.
         palm_rotmat (T,3,3) float32 -- forward/across/normal from wrist and MCPs.
         mcp          dict name -> (T,3) float32, MCP joint centers in world.
         tips         dict name -> (T,3) float32, name in ("thumb","index","middle","ring","pinky")
