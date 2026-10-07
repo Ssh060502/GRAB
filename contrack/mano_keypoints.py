@@ -20,8 +20,10 @@ assumed from memory):
     dims) -- fullpose is the exact unrolled pose GRAB actually used to generate the mesh.
 """
 
+import argparse
 import os
 
+import h5py
 import numpy as np
 import smplx
 import torch
@@ -98,3 +100,39 @@ def get_hand_keypoints(grab_root, seq, is_rhand, start, end, model_path, Rm, tm)
             "mcp": {k: v.astype(np.float32) for k, v in mcp.items()},
             "palm_rotmat": palm_rotmat.astype(np.float32),
             "tips": {k: v.astype(np.float32) for k, v in tips.items()}}
+
+
+def main():
+    """Extract MANO geometry and write it into an existing converted H5 (grab env)."""
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--h5", required=True)
+    ap.add_argument("--grab-root", required=True)
+    ap.add_argument("--model-path", required=True)
+    side = ap.add_mutually_exclusive_group()
+    side.add_argument("--is-rhand", dest="is_rhand", action="store_true")
+    side.add_argument("--is-lhand", dest="is_rhand", action="store_false")
+    ap.set_defaults(is_rhand=True)
+    args = ap.parse_args()
+
+    with h5py.File(args.h5, "r+") as f:
+        g = f["grab_source"]
+        seq, start, end = g.attrs["sequence"], int(g.attrs["start"]), int(g.attrs["end"])
+        Rm, tm = g["Rm"][:], g["tm"][:]
+        kp = get_hand_keypoints(args.grab_root, seq, args.is_rhand, start, end,
+                                args.model_path, Rm, tm)
+        if "keypoints" in g:
+            del g["keypoints"]
+        k = g.create_group("keypoints")
+        for name in ("wrist_pos", "wrist_rotmat", "palm_rotmat"):
+            k.create_dataset(name, data=kp[name])
+        k.attrs["is_rhand"] = int(args.is_rhand)
+        k.attrs["palm_axes"] = "forward,pinky_to_index,right_handed_normal"
+        for name in ("mcp", "tips"):
+            group = k.create_group(name)
+            for finger, arr in kp[name].items():
+                group.create_dataset(finger, data=arr)
+    print(f"wrote keypoints for {seq} [{start}:{end}] into {args.h5}:grab_source/keypoints")
+
+
+if __name__ == "__main__":
+    main()

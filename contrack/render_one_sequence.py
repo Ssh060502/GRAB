@@ -19,7 +19,7 @@ produces a black/garbled image on a headless server, try:
     export PYOPENGL_PLATFORM=egl
 before running (a common fix for headless pyrender; not verified against this specific server).
 
-Runs in the `grab` env (needs smplx/torch, same as compute_hand_keypoints.py), plus one more:
+Runs in the `grab` env (needs smplx/torch, same as mano_keypoints.py), plus one more:
     pip install pyrender
 
 Example:

@@ -1,6 +1,6 @@
 """Inspect stable palm calibration and optionally save robot wrist targets.
 
-Run after compute_hand_keypoints.py. No fingertip/contact averaging is used.
+Run after mano_keypoints.py. No fingertip/contact averaging is used.
 Offset is explicit: MCP alignment alone cannot identify anatomical origin offsets
 between differently proportioned hands. Default keeps the MANO wrist center.
 """
@@ -26,7 +26,7 @@ def main():
     with h5py.File(args.h5, "r+" if args.write_targets else "r") as f:
         k = f["grab_source/keypoints"]
         if "palm_rotmat" not in k:
-            raise SystemExit("Missing palm geometry: rerun compute_hand_keypoints.py")
+            raise SystemExit("Missing palm geometry: rerun mano_keypoints.py")
         if not k.attrs.get("is_rhand", 1):
             raise SystemExit("XHand right calibration requires right-hand keypoints")
         palm, raw = k["palm_rotmat"][:], k["wrist_rotmat"][:]

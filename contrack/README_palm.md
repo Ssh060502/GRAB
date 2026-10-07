@@ -5,10 +5,9 @@ retarget environment. Replace the paths below with your dataset/model/assets pat
 Existing H5 files need fresh keypoint extraction because the old files lack MCPs.
 
 ```bash
-python contrack/compute_hand_keypoints.py --h5 out/clip.h5 --grab-root /path/to/GRAB_dataset --model-path /path/to/GRAB_models
+python contrack/mano_keypoints.py --h5 out/clip.h5 --grab-root /path/to/GRAB_dataset --model-path /path/to/GRAB_models
 python contrack/estimate_calib.py --h5 out/clip.h5 --assets-dir /path/to/ConTrack/assets --write-targets
 python contrack/retarget_xarm_xhand.py --h5 out/clip.h5 --assets-dir /path/to/ConTrack/assets
-python contrack/check_wrist_direction.py --h5 out/clip.h5 --assets-dir /path/to/ConTrack/assets
 ```
 
 `estimate_calib.py` is an inspection step; retargeting also computes the palm
@@ -61,13 +60,11 @@ H5 additions:
 - `grab_source/wrist_targets/actual_positions`, `actual_rotations`: achieved FK,
   written by retargeting.
 
-The direction checker compares forward/across/normal separately. Near-zero target
-axis error verifies the mapping construction; it does not independently verify
-that the chosen URDF landmarks match the physical anatomy. Actual FK errors
-measure the arm's ability to track the target. Finger diagnostics now report
-world position errors, including the arm's remaining tracking error.
-
-The direction checker uses saved wrist targets and actual FK.
+Retargeting automatically reports wrist position and full rotation tracking errors,
+world fingertip errors, joint-limit saturation and sampled reach. These provide
+the routine checks without a separate checker command. The optional
+`check_wrist_direction.py` additionally reports forward/across/normal errors
+separately; removing it does not affect extraction or retargeting.
 No Sharpa IK implementation is added here.
 
 Dependency-light regression checks:

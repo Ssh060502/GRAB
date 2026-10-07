@@ -85,7 +85,7 @@ def solve_fingers(robot, wrist_pos, wrist_rotmat, tips, finger_idx, origin_id, t
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--h5", required=True,
-                    help="the file produced by grab_to_contrack.py + compute_hand_keypoints.py; qpos is filled in place")
+                    help="the file produced by grab_to_contrack.py + mano_keypoints.py; qpos is filled in place")
     ap.add_argument("--assets-dir", required=True, help="ConTrack's assets/ folder (urdf/xarm_xhand_right.urdf, urdf/xhand_right.urdf)")
     ap.add_argument("--contact-priority", action="store_true",
                     help="on contact frames, use GRAB distal contact world positions as fingertip targets")
@@ -97,7 +97,7 @@ def main():
     with h5py.File(args.h5, "r+") as f:
         g = f["grab_source"]
         if "keypoints" not in g:
-            raise SystemExit("no grab_source/keypoints group -- run compute_hand_keypoints.py first (in the `grab` env)")
+            raise SystemExit("no grab_source/keypoints group -- run mano_keypoints.py first (in the `grab` env)")
         kp_grp = g["keypoints"]
         kp = {"wrist_pos": kp_grp["wrist_pos"][:],
               "tips": {name: kp_grp["tips"][name][:] for name in kp_grp["tips"]}}
@@ -105,7 +105,7 @@ def main():
             raise SystemExit("Right-arm retargeting requires right-hand keypoints")
         T = kp["wrist_pos"].shape[0]
         if "palm_rotmat" not in kp_grp:
-            raise SystemExit("Missing palm geometry: rerun compute_hand_keypoints.py")
+            raise SystemExit("Missing palm geometry: rerun mano_keypoints.py")
         hand_urdf = os.path.join(args.assets_dir, "urdf", "xhand_right.urdf")
         basis, _ = robot_palm_frame(RobotWrapper(hand_urdf), hand_urdf)
         wrist_target_pos, wrist_target_rot = wrist_targets(
