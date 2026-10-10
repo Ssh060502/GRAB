@@ -89,6 +89,10 @@ def main():
         start = s0 if start is None else start
         end = e0 if end is None else end
     T = end - start
+    if not 0 <= start < end <= T_all:
+        raise ValueError(f"Invalid frame range [{start}:{end}] for {T_all} frames")
+    if not np.isfinite(float(d["framerate"])) or float(d["framerate"]) <= 0:
+        raise ValueError("GRAB framerate must be finite and positive")
     print(f"{args.seq}: {T_all} frames total, cropping [{start}:{end}] -> {T} frames ({T / float(d['framerate']):.2f} s)")
 
     rv = obj["params"]["global_orient"][start:end].astype(np.float64)

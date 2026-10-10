@@ -1,0 +1,7 @@
+numpy>=1.23
+scipy>=1.9
+h5py>=3.8
+trimesh>=4
+matplotlib>=3.7
+imageio>=2.31
+imageio-ffmpeg>=0.4
