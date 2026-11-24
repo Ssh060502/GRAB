@@ -17,6 +17,7 @@ Only the right hand is retargeted, as in the RB-Y1A route. The left arm holds a
 rest pose with open fingers. No collision avoidance or physics validation.
 """
 import argparse
+import hashlib
 from pathlib import Path
 import shutil
 import numpy as np
@@ -29,10 +30,12 @@ from crx_sharpa_geometry import (CrxSharpaKinematics, FINGERS, ARM_DOF, HAND_DOF
 # operation surface 0.175 m below the left base.
 DEFAULT_SCENE = (0.15, -0.40, -0.175, 0.0)
 DEFAULT_LEFT_BASE = (0., 0., 0., 0., 0., 0.)
-# Used for the earlier real replay; NOT a verified measurement. The current
-# dual_crx_control xacro default is y = -0.99546257. Pass --right-base explicitly
-# once the lab calibration is confirmed.
-DEFAULT_RIGHT_BASE = (0.03058936, -0.91156264, 0.00873476, 0.00994493, -0.01029918, -1.54694055)
+# Current dual_crx_control xacro default (urdf/dual_crx.urdf.xacro on GitHub). A tape
+# measurement of the base spacing gave about 1.0 m, consistent with this value and
+# not with the older 0.9116 m still loaded on the lab PC as of its Oct 9 checkout.
+# It is a calibration result, not re-verified here: pass --right-base if it changes.
+DEFAULT_RIGHT_BASE = (0.03340744, -0.99546257, 0.01093060, 0.01335405, -0.02065696, -1.54875984)
+PREVIOUS_RIGHT_BASE = (0.03058936, -0.91156264, 0.00873476, 0.00994493, -0.01029918, -1.54694055)
 # First-frame / recovery seeds in ROS/URDF degrees. The lab rest pose comes first
 # so the chosen IK branch matches how the real arm is normally configured.
 ARM_SEEDS_DEG = (REST_ARM_DEG["right"], (-20., -60., 215., -70., -95., -30.),
@@ -199,7 +202,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--h5", required=True, help="Sharpa H5 with grab_source/keypoints; read only")
     ap.add_argument("--out", required=True, help="New CRX+Sharpa H5")
-    ap.add_argument("--right-urdf", required=True, help="Single-side crx5ia_sharpa_wave_right URDF")
+    ap.add_argument("--right-urdf", required=True,
+                    help="Single-arm right model; for training use ConTrack assets/urdf/crx_sharpa_right.urdf")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--scene-transform", type=float, nargs=4, default=DEFAULT_SCENE,
                     metavar=("X", "Y", "Z", "YAW_DEG"), help="Source world -> CRX world (left base origin)")
@@ -207,7 +211,7 @@ def main():
                     metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"))
     ap.add_argument("--right-base", type=float, nargs=6, default=DEFAULT_RIGHT_BASE,
                     metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
-                    help="Radians. Default is the unverified earlier replay value")
+                    help="Meters/radians. Default is the current dual_crx_control calibration")
     ap.add_argument("--left-rest-deg", type=float, nargs=6, default=REST_ARM_DEG["left"],
                     help="Left arm J1..J6 in ROS/URDF degrees; left fingers stay at zero")
     ap.add_argument("--time-scale", type=float, default=1.,
@@ -287,6 +291,10 @@ def main():
             f.attrs["retarget_method"] = "crx_sharpa_right_palm_intermediate"
             f.attrs["scene_transform_xyz_yaw_deg"] = np.asarray(args.scene_transform, float)
             f.attrs["right_base_verified"] = 0
+            # LF-normalized, matching ConTrack's asset record: ties this file to one arm model.
+            f.attrs["right_urdf_sha256"] = hashlib.sha256(
+                Path(args.right_urdf).read_bytes().replace(bytes([13, 10]), bytes([10]))).hexdigest()
+            f.attrs["right_urdf_name"] = Path(args.right_urdf).name
             f.attrs["time_scale"] = args.time_scale
             f.attrs["source_fps"] = source_fps
             f.attrs["retarget_wrist_offset_palm_m"] = args.wrist_offset_palm

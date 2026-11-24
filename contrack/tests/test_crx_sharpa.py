@@ -134,6 +134,7 @@ class CrxSharpaTests(unittest.TestCase):
                 self.assertEqual(f["qpos"].shape, (count, 2, 28))
                 np.testing.assert_allclose(f["fps"][:], [40., 40.])
                 self.assertEqual(f.attrs["time_scale"], 3.)
+                self.assertEqual(len(f.attrs["right_urdf_sha256"]), 64)
                 np.testing.assert_allclose(f["qpos"][:, 1, :6], self.arm_path, atol=1e-4)
                 np.testing.assert_allclose(f["qpos"][:, 0, :6],
                                            np.tile(np.deg2rad(REST_ARM_DEG["left"]), (count, 1)), atol=1e-6)
