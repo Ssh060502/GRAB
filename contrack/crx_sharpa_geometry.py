@@ -81,7 +81,7 @@ class CrxSharpaKinematics:
                 transform[:3, 3] = np.array(origin.get("xyz", "0 0 0").split(), dtype=float)
                 transform[:3, :3] = Rotation.from_euler(
                     "xyz", np.array(origin.get("rpy", "0 0 0").split(), dtype=float)).as_matrix()
-            axis, bounds = np.array([1., 0., 0.]), (0., 0.)
+            axis, bounds, velocity = np.array([1., 0., 0.]), (0., 0.), 0.
             if kind != "fixed":
                 axis = np.array(element.find("axis").get("xyz").split(), dtype=float)
                 if np.linalg.norm(axis) < 1e-12:
@@ -89,9 +89,11 @@ class CrxSharpaKinematics:
                 axis = axis / np.linalg.norm(axis)
                 limit = element.find("limit")
                 bounds = (float(limit.get("lower")), float(limit.get("upper")))
+                velocity = float(limit.get("velocity"))
             child = element.find("child").get("link")
             joints.append(dict(name=element.get("name"), parent=element.find("parent").get("link"),
-                               child=child, origin=transform, axis=axis, kind=kind, bounds=bounds))
+                               child=child, origin=transform, axis=axis, kind=kind, bounds=bounds,
+                               velocity=velocity))
             children.add(child)
         roots = links - children
         if len(roots) != 1:
@@ -118,6 +120,10 @@ class CrxSharpaKinematics:
 
     def limits(self, names):
         return np.array([self.by_name[n]["bounds"] for n in names])
+
+    def velocity_limits(self, names):
+        """URDF joint velocity limits, rad/s."""
+        return np.array([self.by_name[n]["velocity"] for n in names])
 
     def fk(self, q=None):
         q = {} if q is None else q

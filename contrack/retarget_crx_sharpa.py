@@ -10,6 +10,8 @@ IK, tip + PIP/IP + DIP finger fit). What differs is the robot:
     into the CRX world, whose origin is the LEFT arm base.
   * each arm has its own base pose (xyz + roll/pitch/yaw); the right base is not identity.
   * qpos is (T, 2, 28): J1..J6 then 22 Sharpa joints, left/right order.
+  * --time-scale slows the clip by dividing the stored fps. Human motion at
+    original speed can exceed the CRX joint velocity limits.
 
 Only the right hand is retargeted, as in the RB-Y1A route. The left arm holds a
 rest pose with open fingers. No collision avoidance or physics validation.
@@ -208,6 +210,8 @@ def main():
                     help="Radians. Default is the unverified earlier replay value")
     ap.add_argument("--left-rest-deg", type=float, nargs=6, default=REST_ARM_DEG["left"],
                     help="Left arm J1..J6 in ROS/URDF degrees; left fingers stay at zero")
+    ap.add_argument("--time-scale", type=float, default=1.,
+                    help="Duration multiplier >= 1. Frames are unchanged; the stored fps is divided")
     ap.add_argument("--wrist-offset-palm", type=float, nargs=3, default=(0., 0., 0.))
     ap.add_argument("--orientation-scale", type=float, default=.05, help="arm orientation weight, m/rad")
     ap.add_argument("--intermediate-weight", type=float, default=.35)
@@ -215,6 +219,8 @@ def main():
     args = ap.parse_args()
     numbers = np.r_[args.scene_transform, args.left_base, args.right_base, args.left_rest_deg,
                     args.wrist_offset_palm, args.orientation_scale, args.intermediate_weight, args.regularization]
+    if not np.isfinite(args.time_scale) or args.time_scale < 1.:
+        ap.error("--time-scale must be finite and >= 1")
     if (not np.isfinite(numbers).all() or args.orientation_scale <= 0
             or args.intermediate_weight < 0 or args.regularization < 0):
         ap.error("All values must be finite; weights nonnegative, orientation scale positive")
@@ -233,6 +239,9 @@ def main():
         ap.error("--left-rest-deg is outside the CRX joint limits")
     with h5py.File(source, "r") as f:
         arrays = read_keypoints(f)
+        source_fps = f["fps"][:].astype(float)
+        if not np.isfinite(source_fps).all() or np.any(source_fps <= 0):
+            raise ValueError("Invalid source fps")
         if "contacts/0/is_contact" in f:
             left_frames = int(f["contacts/0/is_contact"][:, 0].any(axis=1).sum())
             if left_frames:
@@ -249,7 +258,13 @@ def main():
     bounds = model.limits(names)
     lower = qpos[:, 1]-bounds[:, 0] < 1e-3
     upper = bounds[:, 1]-qpos[:, 1] < 1e-3
-    arm_step = np.abs(np.diff(result["qpos"][:, :ARM_DOF], axis=0)).max(axis=1) if count > 1 else np.zeros(1)
+    arm_delta = np.abs(np.diff(result["qpos"][:, :ARM_DOF], axis=0)) if count > 1 else np.zeros((1, ARM_DOF))
+    arm_step = arm_delta.max(axis=1)
+    fps = source_fps / args.time_scale
+    velocity_limit = model.velocity_limits(model.arm_names)
+    arm_speed = arm_delta * float(fps.max())
+    # Smallest total slowdown, relative to the source clip, that keeps every arm joint in limits.
+    needed_scale = float((arm_delta * float(source_fps.max()) / velocity_limit).max())
 
     out.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, out)
@@ -260,6 +275,7 @@ def main():
                 if name in f:
                     del f[name]
             f.create_dataset("qpos", data=qpos)
+            f["fps"][:] = fps.astype(f["fps"].dtype)
             f.create_dataset("urdf_name", data=np.array([s.encode() for s in URDF_NAMES], dtype="S40"))
             f.create_dataset("base_translation", data=bases[:, :3, 3].astype(np.float32))
             f.create_dataset("base_rpy", data=np.array([args.left_base[3:], args.right_base[3:]], np.float32))
@@ -271,6 +287,8 @@ def main():
             f.attrs["retarget_method"] = "crx_sharpa_right_palm_intermediate"
             f.attrs["scene_transform_xyz_yaw_deg"] = np.asarray(args.scene_transform, float)
             f.attrs["right_base_verified"] = 0
+            f.attrs["time_scale"] = args.time_scale
+            f.attrs["source_fps"] = source_fps
             f.attrs["retarget_wrist_offset_palm_m"] = args.wrist_offset_palm
             f.attrs["retarget_intermediate_weight"] = args.intermediate_weight
             f.attrs["retarget_regularization_m_per_rad"] = args.regularization
@@ -306,6 +324,15 @@ def main():
         print(f"{name}: {lower[:, i].mean()*100:.1f} / {upper[:, i].mean()*100:.1f}")
     print("Optimizer success counts (arm/fingers):", result["successes"].sum(axis=0), "/", count)
     print(f"Largest arm joint change between frames: {arm_step.max():.4f} rad at frame {int(arm_step.argmax())+1}")
+    print(f"Time scale {args.time_scale:g}: stored fps {fps.max():g}, duration {(count-1)/fps.max():.2f} s")
+    print("Arm joint speed max (rad/s):", np.round(arm_speed.max(axis=0), 2),
+          "limits:", np.round(velocity_limit, 2))
+    over = (arm_speed > velocity_limit).any(axis=1)
+    print(f"Frames over an arm velocity limit: {int(over.sum())} of {len(over)}; "
+          f"smallest --time-scale that removes them: {needed_scale:.2f}")
+    if over.any():
+        print("WARNING: the arm cannot follow this clip at the stored speed. "
+              "Rerun with a larger --time-scale.")
     if pos_err.max() > .01 or rot_err.max() > 5.:
         print("WARNING: wrist target not reached in some frames (unreachable or at a joint limit). "
               "Adjust --scene-transform or the base pose before training on this file.")

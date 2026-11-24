@@ -86,6 +86,10 @@ class CrxSharpaTests(unittest.TestCase):
         np.testing.assert_allclose(result["qpos"][:, :6], self.arm_path, atol=1e-5)
         np.testing.assert_allclose(result["actual_pos"], arrays["wrist"], atol=1e-6)
 
+    def test_velocity_limits_come_from_the_urdf(self):
+        np.testing.assert_allclose(self.model.velocity_limits(self.model.arm_names),
+                                   np.deg2rad([150., 150., 180., 225., 225., 225.]), atol=1e-9)
+
     def test_scene_matrix_keeps_table_horizontal(self):
         scene = scene_matrix(.15, -.4, -.175, np.deg2rad(90.))
         np.testing.assert_allclose(scene[:3, :3] @ [0, 0, 1], [0, 0, 1], atol=1e-12)
@@ -123,10 +127,13 @@ class CrxSharpaTests(unittest.TestCase):
                         group.create_dataset(finger, data=transform_points(inverse, crx[name][:, i]))
             before = source.read_bytes()
             subprocess.run([sys.executable, str(CONTRACK / "retarget_crx_sharpa.py"), "--h5", str(source),
-                            "--out", str(out), "--right-urdf", str(URDF)], check=True, cwd=CONTRACK)
+                            "--out", str(out), "--right-urdf", str(URDF), "--time-scale", "3"],
+                           check=True, cwd=CONTRACK)
             self.assertEqual(before, source.read_bytes())
             with h5py.File(out, "r") as f:
                 self.assertEqual(f["qpos"].shape, (count, 2, 28))
+                np.testing.assert_allclose(f["fps"][:], [40., 40.])
+                self.assertEqual(f.attrs["time_scale"], 3.)
                 np.testing.assert_allclose(f["qpos"][:, 1, :6], self.arm_path, atol=1e-4)
                 np.testing.assert_allclose(f["qpos"][:, 0, :6],
                                            np.tile(np.deg2rad(REST_ARM_DEG["left"]), (count, 1)), atol=1e-6)
