@@ -1,5 +1,51 @@
 # GRAB to ConTrack: RB-Y1A + Sharpa (right side)
 
+## Optional CRX whole-trajectory arm search
+
+For the separate `retarget_crx_sharpa.py` route, add `--arm-search` to the existing
+conversion command and use a new `--out` filename. Without this flag the original
+framewise solver is retained. RB-Y1A/XHand paths and the CRX finger objective are unchanged.
+
+```bash
+python contrack/retarget_crx_sharpa.py \
+    --h5 /path/to/grab-source.h5 --out /path/to/crx-searched.h5 \
+    --right-urdf ~/ConTrack/assets/urdf/crx_sharpa_right.urdf \
+    --hands right --arm-search
+```
+
+The search fits all configured first-frame seeds, deduplicates solutions, and
+enumerates in-limit whole-turn representatives (including J1/J4/J6). Each start
+tracks the entire arm sequence with local bounded IK, with no unrelated fallback
+seeds at later frames. Difficult transitions retry interpolated target midpoints.
+Only the chosen complete arm track is then passed through the existing finger fit.
+
+Acceptance requires wrist error <=1 mm and <=0.5 degrees, joint-limit clearance
+`--arm-search-limit-margin` (default .001 rad), and per-joint frame change below
+`--arm-search-max-step` (default .3 rad). Midpoint retry depth is controlled by
+`--arm-search-subdivisions` (default 3, maximum 8). A smaller maximum step can
+reject genuinely fast motions; it is a continuity guard, not an execution speed limit.
+No precise topological branch identity is enforced: continuous passage near a
+singularity is possible, so velocity and collision checks are still required.
+
+Complete paths are ranked by required joint speed relative to URDF limits,
+maximum joint step, total joint travel and minimum limit clearance, in that order.
+A complete track may still exceed velocity limits; inspect the normal report and
+adjust `--time-scale` if appropriate. There is no acceleration/collision validation.
+Subdivision does not add H5 frames or certify the physical path between them.
+
+Candidate starts, first failed frame (-1 for complete), tracked length, speed ratio,
+maximum step, clearance and the selected candidate are stored under each side's
+`grab_source/sharpa_diagnostics[/arm_search]` (left uses `sharpa_diagnostics_left`).
+If no candidate completes, the script reports failure frames and writes no new
+output. Existing output files are not deleted in this failure path. This is a
+finite search failure, not proof that the motion is unreachable. More initial
+seeds, solver diagnosis, or different scene placement may still help.
+
+```bash
+python contrack/tests/test_crx_arm_search.py -v
+python contrack/tests/test_crx_sharpa.py
+```
+
 This is independent of the XArm/XHand solver. Existing XHand scripts are unchanged.
 The first implementation retargets the right arm and hand. Left arm uses ConTrack's
 `[0,0,0,-1.57,0,0,0]` pose and left fingers remain at zero. Left-contact GRAB clips

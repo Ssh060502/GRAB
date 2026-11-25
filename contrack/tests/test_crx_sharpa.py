@@ -195,6 +195,21 @@ class CrxSharpaTests(unittest.TestCase):
                                            self.base[:3, :3], atol=1e-6)
                 self.assertLess(f["grab_source/sharpa_diagnostics/wrist_position_error_m"][:].max(), 1e-5)
 
+            # The optional whole-trajectory mode must work through the CLI/H5
+            # interface while preserving the original input and default path.
+            searched = Path(folder) / "searched.h5"
+            subprocess.run([sys.executable, str(CONTRACK / "retarget_crx_sharpa.py"), "--h5", str(source),
+                            "--out", str(searched), "--right-urdf", str(URDF), "--time-scale", "3",
+                            "--arm-search"], check=True, cwd=CONTRACK, capture_output=True)
+            self.assertEqual(before, source.read_bytes())
+            with h5py.File(searched, "r") as f:
+                self.assertEqual(f.attrs["arm_solver"], "trajectory_search")
+                search = f["grab_source/sharpa_diagnostics/arm_search"]
+                selected = int(search.attrs["selected_candidate"])
+                self.assertEqual(search["candidate_summary"][selected, 0], -1)
+                self.assertLess(f["grab_source/sharpa_diagnostics/wrist_position_error_m"][:].max(), .001)
+                self.assertLess(np.abs(np.diff(f["qpos"][:,1,:6], axis=0)).max(), .3)
+
 
     @unittest.skipIf(h5py is None, "h5py unavailable")
     def test_command_line_retargets_both_hands(self):

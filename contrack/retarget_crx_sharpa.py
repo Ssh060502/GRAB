@@ -139,7 +139,8 @@ def transform_points(matrix, points):
 
 
 def retarget_side(model, arrays, base, wrist_offset=(0., 0., 0.), orientation_scale=.05,
-                  intermediate_weight=.35, regularization=.001, progress=None):
+                  intermediate_weight=.35, regularization=.001, progress=None,
+                  arm_search=False, search_options=None):
     """arrays: wrist (T,3), palm (T,3,3), tips (T,5,3), pip (T,5,3), dip (T,4,3) in the CRX world.
 
     model and arrays must belong to the same side; base is that arm's base pose (4x4).
@@ -157,13 +158,25 @@ def retarget_side(model, arrays, base, wrist_offset=(0., 0., 0.), orientation_sc
     pos_err, rot_err, finger_err = np.zeros(count), np.zeros(count), np.zeros((count, 5))
     successes = np.zeros((count, 2), dtype=np.uint8)
     seeds = [np.deg2rad(s) for s in SEEDS_DEG[model.side]]
+    search = None
+    if arm_search:
+        from crx_arm_search import search_arm_trajectory
+        local_positions = transform_points(base_inv, target_pos)
+        local_rotations = base_inv[:3, :3] @ target_rot
+        search = search_arm_trajectory(model, local_positions, local_rotations, seeds,
+                                       orientation_scale, progress=progress, **(search_options or {}))
+        if progress:
+            progress(f"{model.side}: selected arm candidate {search['selected']+1}; starting unchanged finger fit")
     arm_q, hand_q = None, np.zeros(HAND_DOF)
     for t in range(count):
         local_pos = base_inv[:3, :3] @ target_pos[t] + base_inv[:3, 3]
         local_rot = base_inv[:3, :3] @ target_rot[t]
-        arm = solve_arm(model, local_pos, local_rot, seeds if arm_q is None else [arm_q] + seeds,
-                        orientation_scale, previous=arm_q)
-        arm_q = arm.x
+        if search is None:
+            arm = solve_arm(model, local_pos, local_rot, seeds if arm_q is None else [arm_q] + seeds,
+                            orientation_scale, previous=arm_q)
+            arm_q, arm_success = arm.x, arm.success
+        else:
+            arm_q, arm_success = search["path"][t], search["success"][t]
         achieved = base @ model.palm_pose(arm_q)
         actual_pos[t], actual_rot[t] = achieved[:3, 3], achieved[:3, :3]
         local = {name: (arrays[name][t]-actual_pos[t]) @ actual_rot[t] for name in ("tips", "pip", "dip")}
@@ -176,12 +189,12 @@ def retarget_side(model, arrays, base, wrist_offset=(0., 0., 0.), orientation_sc
         finger_err[t] = np.linalg.norm(tip_world-arrays["tips"][t], axis=1)
         pos_err[t] = np.linalg.norm(actual_pos[t]-target_pos[t])
         rot_err[t] = Rotation.from_matrix(target_rot[t].T @ actual_rot[t]).magnitude()*180/np.pi
-        successes[t] = [arm.success, fingers.success]
+        successes[t] = [arm_success, fingers.success]
         if progress is not None and t % 50 == 0:
             progress(f"{model.side} frame {t}/{count}: wrist {pos_err[t]*1000:.2f} mm / {rot_err[t]:.2f} deg")
     return dict(qpos=qpos, target_pos=target_pos, target_rot=target_rot, actual_pos=actual_pos,
                 actual_rot=actual_rot, pos_err=pos_err, rot_err=rot_err, finger_err=finger_err,
-                successes=successes, basis=basis)
+                successes=successes, basis=basis, arm_search=search)
 
 
 def read_keypoints(f, side="right"):
@@ -277,7 +290,16 @@ def main():
     ap.add_argument("--orientation-scale", type=float, default=.05, help="arm orientation weight, m/rad")
     ap.add_argument("--intermediate-weight", type=float, default=.35)
     ap.add_argument("--regularization", type=float, default=.001, help="previous finger pose weight, m/rad")
+    ap.add_argument("--arm-search", action="store_true",
+                    help="Trace full arm trajectories from distinct first-frame candidates before fitting fingers")
+    ap.add_argument("--arm-search-max-step", type=float, default=.3, help="max joint change per frame (rad)")
+    ap.add_argument("--arm-search-limit-margin", type=float, default=.001, help="required joint-limit clearance (rad)")
+    ap.add_argument("--arm-search-subdivisions", type=int, default=3, help="local midpoint retry depth")
     args = ap.parse_args()
+    if (not np.isfinite([args.arm_search_max_step,args.arm_search_limit_margin]).all() or
+            args.arm_search_max_step<=0 or args.arm_search_limit_margin<0 or
+            not 0<=args.arm_search_subdivisions<=8):
+        ap.error("Arm search requires positive finite max step, nonnegative margin and subdivision depth 0..8")
     numbers = np.r_[args.scene_transform, args.left_base, args.right_base, args.left_rest_deg,
                     args.right_rest_deg, args.wrist_offset_palm, args.orientation_scale,
                     args.intermediate_weight, args.regularization]
@@ -326,7 +348,11 @@ def main():
                  for name, value in arrays[side].items()}
         results[side] = retarget_side(models[side], moved, bases[SIDES.index(side)], args.wrist_offset_palm,
                                       args.orientation_scale, args.intermediate_weight,
-                                      args.regularization, progress=print)
+                                      args.regularization, progress=print, arm_search=args.arm_search,
+                                      search_options=dict(max_step=args.arm_search_max_step,
+                                          limit_margin=args.arm_search_limit_margin,
+                                          subdivisions=args.arm_search_subdivisions,
+                                          fps=float(source_fps.max())/args.time_scale))
     count = len(next(iter(results.values()))["qpos"])
     qpos = np.zeros((count, 2, SIDE_DOF), dtype=np.float32)
     fps = source_fps / args.time_scale
@@ -370,6 +396,11 @@ def main():
             f.attrs["retarget_method"] = ("crx_sharpa_right_palm_intermediate" if args.hands == "right"
                                           else "crx_sharpa_palm_intermediate")
             f.attrs["retargeted_hands"] = args.hands
+            f.attrs["arm_solver"] = "trajectory_search" if args.arm_search else "framewise"
+            if args.arm_search:
+                f.attrs["arm_search_max_step_rad"] = args.arm_search_max_step
+                f.attrs["arm_search_limit_margin_rad"] = args.arm_search_limit_margin
+                f.attrs["arm_search_subdivision_depth"] = args.arm_search_subdivisions
             f.attrs["scene_transform_xyz_yaw_deg"] = np.asarray(args.scene_transform, float)
             f.attrs["right_base_verified"] = 0
             for side in SIDES:
@@ -404,6 +435,14 @@ def main():
                     d.create_dataset(name, data=data)
                 d.create_dataset("joint_names", data=np.array(info["names"], dtype="S40"))
                 d.create_dataset("finger_names", data=np.array(FINGERS, dtype="S10"))
+                if result["arm_search"] is not None:
+                    search = result["arm_search"]
+                    g = d.create_group("arm_search")
+                    g.attrs["selected_candidate"] = search["selected"]
+                    g.attrs["summary_columns"] = search["summary_columns"]
+                    g.attrs["scope"] = "finite local search; no collision/acceleration validation"
+                    g.create_dataset("initial_candidates", data=search["starts"])
+                    g.create_dataset("candidate_summary", data=search["summary"])
     except Exception:
         out.unlink(missing_ok=True)  # never leave a half-converted file that looks valid
         raise
