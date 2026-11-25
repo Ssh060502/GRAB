@@ -62,13 +62,39 @@ def arm_errors(model, q, target_pos, target_rot):
             Rotation.from_matrix(target_rot.T @ pose[:3, :3]).magnitude())
 
 
-def solve_arm(model, target_pos, target_rot, seeds, orientation_scale=.05):
+def choose_turn(q, bounds, previous=None):
+    """Pick, per joint, the in-limit angle q, q+2pi or q-2pi; all give the same arm pose.
+
+    Only joints whose range exceeds a full turn have a choice (CRX J1, J4, J6).
+    With a previous frame, the angle closest to it is kept, so the joint does not
+    spin a full turn between frames. Without one (first frame), the angle farthest
+    from both limits is kept, leaving room for later motion in either direction.
+    """
+    q = np.array(q, float)
+    for j, (low, high) in enumerate(bounds):
+        options = [v for v in (q[j], q[j] + 2*np.pi, q[j] - 2*np.pi) if low <= v <= high]
+        if previous is not None:
+            q[j] = min(options, key=lambda v: abs(v - previous[j]))
+        else:
+            q[j] = max(options, key=lambda v: min(v - low, high - v))
+    return q
+
+
+def solve_arm(model, target_pos, target_rot, seeds, orientation_scale=.05, previous=None):
     """Targets are in the arm base frame. Seeds are tried in order.
 
     The first seed is the continuity seed (previous frame). Later seeds are only
     tried while tracking is poor; the first one that tracks well wins, otherwise
     the lowest residual. A 6-axis arm has no elbow redundancy to trade off.
+    The returned angles are then shifted by full turns where the limits allow
+    (choose_turn); this never changes the achieved wrist pose.
     """
+    result = _solve_arm(model, target_pos, target_rot, seeds, orientation_scale)
+    result.x = choose_turn(result.x, model.limits(model.arm_names), previous)
+    return result
+
+
+def _solve_arm(model, target_pos, target_rot, seeds, orientation_scale):
     bounds = model.limits(model.arm_names)
     def residual(q):
         pose = model.palm_pose(q)
@@ -136,7 +162,7 @@ def retarget_side(model, arrays, base, wrist_offset=(0., 0., 0.), orientation_sc
         local_pos = base_inv[:3, :3] @ target_pos[t] + base_inv[:3, 3]
         local_rot = base_inv[:3, :3] @ target_rot[t]
         arm = solve_arm(model, local_pos, local_rot, seeds if arm_q is None else [arm_q] + seeds,
-                        orientation_scale)
+                        orientation_scale, previous=arm_q)
         arm_q = arm.x
         achieved = base @ model.palm_pose(arm_q)
         actual_pos[t], actual_rot[t] = achieved[:3, 3], achieved[:3, :3]

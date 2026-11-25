@@ -14,7 +14,7 @@ CONTRACK = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CONTRACK))
 from crx_sharpa_geometry import (CrxSharpaKinematics, ARM_NAMES, HAND_SUFFIXES, SIDE_DOF,
                                  REST_ARM_DEG, pose_matrix, scene_matrix)
-from retarget_crx_sharpa import (retarget_side, solve_arm, transform_points,
+from retarget_crx_sharpa import (retarget_side, solve_arm, choose_turn, transform_points,
                                  DEFAULT_LEFT_BASE, DEFAULT_RIGHT_BASE, ARM_SEEDS_DEG)
 URDF = Path(__file__).parent / "crx_assets" / "crx5ia_sharpa_wave_right.urdf"
 # Copy of ConTrack assets/urdf/crx_sharpa_left.urdf (calibrated hand mount); kinematics only.
@@ -77,6 +77,29 @@ class CrxSharpaTests(unittest.TestCase):
         np.testing.assert_allclose(achieved, target, atol=1e-6)
         bounds = self.model.limits(self.model.arm_names)
         self.assertTrue(np.all(result.x >= bounds[:, 0]) and np.all(result.x <= bounds[:, 1]))
+
+    def test_choose_turn_keeps_pose_and_prefers_room_or_continuity(self):
+        bounds = self.model.limits(self.model.arm_names)
+        q = np.deg2rad([190., 50., -34., -159., 62., 225.])
+        first = choose_turn(q, bounds)
+        # J1 190 -> -170 and J6 225 (at its limit) -> -135; J2/J3/J5 have no full-turn choice.
+        np.testing.assert_allclose(np.rad2deg(first), [-170., 50., -34., -159., 62., -135.], atol=1e-9)
+        np.testing.assert_allclose(self.model.palm_pose(first), self.model.palm_pose(q), atol=1e-9)
+        # With a previous frame the nearest equivalent angle wins, even near a limit.
+        near = choose_turn(np.deg2rad([-165., 50., -34., -159., 62., -142.]), bounds,
+                           previous=np.deg2rad([195., 50., -34., -159., 62., 220.]))
+        np.testing.assert_allclose(np.rad2deg(near), [195., 50., -34., -159., 62., 218.], atol=1e-9)
+        # 230 would be outside J6's +-225 limit, so -130 is the only option and is kept.
+        stuck = choose_turn(np.deg2rad([0., 0., 0., 0., 0., -130.]), bounds,
+                            previous=np.deg2rad([0., 0., 0., 0., 0., 224.]))
+        self.assertAlmostEqual(np.rad2deg(stuck[5]), -130., places=9)
+
+    def test_first_frame_seed_near_a_limit_is_turned_away_from_it(self):
+        q = np.deg2rad([-90., -30., 210., 0., -60., 215.])  # J6 10 deg from its +225 limit
+        target = self.model.palm_pose(q)
+        result = solve_arm(self.model, target[:3, 3], target[:3, :3], [q])
+        np.testing.assert_allclose(self.model.palm_pose(result.x), target, atol=1e-6)
+        self.assertAlmostEqual(np.rad2deg(result.x[5]), 215. - 360., places=4)
 
     def test_retarget_recovers_reachable_motion_on_the_rest_branch(self):
         arrays = synthetic_targets(self.model, self.base, self.arm_path, self.finger_path)
