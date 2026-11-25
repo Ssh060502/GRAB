@@ -14,9 +14,11 @@ CONTRACK = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(CONTRACK))
 from crx_sharpa_geometry import (CrxSharpaKinematics, ARM_NAMES, HAND_SUFFIXES, SIDE_DOF,
                                  REST_ARM_DEG, pose_matrix, scene_matrix)
-from retarget_crx_sharpa import (retarget_right, solve_arm, transform_points,
-                                 DEFAULT_RIGHT_BASE, ARM_SEEDS_DEG)
+from retarget_crx_sharpa import (retarget_side, solve_arm, transform_points,
+                                 DEFAULT_LEFT_BASE, DEFAULT_RIGHT_BASE, ARM_SEEDS_DEG)
 URDF = Path(__file__).parent / "crx_assets" / "crx5ia_sharpa_wave_right.urdf"
+# Copy of ConTrack assets/urdf/crx_sharpa_left.urdf (calibrated hand mount); kinematics only.
+LEFT_URDF = Path(__file__).parent / "crx_assets" / "crx_sharpa_left_calibrated.urdf"
 try:
     import h5py
 except Exception:  # missing, or a broken binary install
@@ -78,13 +80,36 @@ class CrxSharpaTests(unittest.TestCase):
 
     def test_retarget_recovers_reachable_motion_on_the_rest_branch(self):
         arrays = synthetic_targets(self.model, self.base, self.arm_path, self.finger_path)
-        result = retarget_right(self.model, arrays, self.base)
+        result = retarget_side(self.model, arrays, self.base)
         self.assertLess(result["pos_err"].max(), 1e-6)
         self.assertLess(result["rot_err"].max(), 1e-4)
         self.assertLess(result["finger_err"].max(), 5e-4)
         # Same IK branch as the lab rest pose, and continuous along the path.
         np.testing.assert_allclose(result["qpos"][:, :6], self.arm_path, atol=1e-5)
         np.testing.assert_allclose(result["actual_pos"], arrays["wrist"], atol=1e-6)
+
+    def left_setup(self):
+        model = CrxSharpaKinematics(LEFT_URDF, "left")
+        steps = np.linspace(0., 1., 8)[:, None]
+        arm_path = np.deg2rad(REST_ARM_DEG["left"]) + steps * np.array([-.3, .2, -.15, .4, -.3, .35])
+        low, high = model.limits(model.hand_names).T
+        return model, pose_matrix(DEFAULT_LEFT_BASE), arm_path, low + (.15 + .35 * steps) * (high - low)
+
+    def test_left_palm_basis_is_right_handed_orthonormal(self):
+        model, _, _, _ = self.left_setup()
+        self.assertEqual(model.hand_names, ["left_" + s for s in HAND_SUFFIXES])
+        basis, _ = model.palm_basis()
+        np.testing.assert_allclose(basis.T @ basis, np.eye(3), atol=1e-12)
+        self.assertAlmostEqual(np.linalg.det(basis), 1., places=12)
+
+    def test_retarget_recovers_reachable_left_motion(self):
+        model, base, arm_path, finger_path = self.left_setup()
+        arrays = synthetic_targets(model, base, arm_path, finger_path)
+        result = retarget_side(model, arrays, base)
+        self.assertLess(result["pos_err"].max(), 1e-6)
+        self.assertLess(result["rot_err"].max(), 1e-4)
+        self.assertLess(result["finger_err"].max(), 5e-4)
+        np.testing.assert_allclose(result["qpos"][:, :6], arm_path, atol=1e-5)
 
     def test_velocity_limits_come_from_the_urdf(self):
         np.testing.assert_allclose(self.model.velocity_limits(self.model.arm_names),
@@ -146,6 +171,49 @@ class CrxSharpaTests(unittest.TestCase):
                 np.testing.assert_allclose(Rotation.from_quat(quat[[1, 2, 3, 0]]).as_matrix(),
                                            self.base[:3, :3], atol=1e-6)
                 self.assertLess(f["grab_source/sharpa_diagnostics/wrist_position_error_m"][:].max(), 1e-5)
+
+
+    @unittest.skipIf(h5py is None, "h5py unavailable")
+    def test_command_line_retargets_both_hands(self):
+        scene = scene_matrix(.15, -.4, -.175, 0.)
+        inverse = np.linalg.inv(scene)
+        left_model, left_base, left_arm, left_fingers = self.left_setup()
+        targets = {"keypoints": synthetic_targets(self.model, self.base, self.arm_path, self.finger_path),
+                   "keypoints_left": synthetic_targets(left_model, left_base, left_arm, left_fingers)}
+        count = len(self.arm_path)
+        with tempfile.TemporaryDirectory() as folder:
+            source, out = Path(folder) / "in.h5", Path(folder) / "out.h5"
+            with h5py.File(source, "w") as f:
+                f.create_dataset("qpos", data=np.full((count, 2, 29), np.nan, np.float32))
+                f.create_dataset("is_rhand", data=np.array([0, 1], np.uint8))
+                f.create_dataset("fps", data=np.array([120., 120.], np.float32))
+                g = f.create_group("object_tracks/0")
+                g.create_dataset("translations", data=np.tile([.5, 0., .01], (count, 1)).astype(np.float32))
+                g.create_dataset("orientations_xyzw", data=np.tile([0., 0., 0., 1.], (count, 1)).astype(np.float32))
+                s = f.create_group("grab_source")
+                s.create_dataset("Rm", data=np.eye(3))
+                s.create_dataset("tm", data=np.zeros(3))
+                for group_name, crx in targets.items():
+                    k = s.create_group(group_name)
+                    k.attrs["is_rhand"] = int(group_name == "keypoints")
+                    k.create_dataset("wrist_pos", data=transform_points(inverse, crx["wrist"]))
+                    k.create_dataset("palm_rotmat", data=inverse[:3, :3] @ crx["palm"])
+                    for name, fingers in (("tips", 5), ("pip", 5), ("dip", 4)):
+                        group = k.create_group(name)
+                        order = ("thumb", "index", "middle", "ring", "pinky")[5 - fingers:]
+                        for i, finger in enumerate(order):
+                            group.create_dataset(finger, data=transform_points(inverse, crx[name][:, i]))
+            subprocess.run([sys.executable, str(CONTRACK / "retarget_crx_sharpa.py"), "--h5", str(source),
+                            "--out", str(out), "--right-urdf", str(URDF), "--left-urdf", str(LEFT_URDF),
+                            "--hands", "both"], check=True, cwd=CONTRACK)
+            with h5py.File(out, "r") as f:
+                np.testing.assert_allclose(f["qpos"][:, 0, :6], left_arm, atol=1e-4)
+                np.testing.assert_allclose(f["qpos"][:, 1, :6], self.arm_path, atol=1e-4)
+                self.assertEqual(f.attrs["retargeted_hands"], "both")
+                self.assertEqual(len(f.attrs["left_urdf_sha256"]), 64)
+                for suffix in ("", "_left"):
+                    self.assertLess(
+                        f[f"grab_source/sharpa_diagnostics{suffix}/wrist_position_error_m"][:].max(), 1e-5)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,11 @@
-"""Right FANUC CRX-5iA + Sharpa: palm wrist IK, then 22 finger joints at the actual wrist.
+"""FANUC CRX-5iA + Sharpa: palm wrist IK, then 22 finger joints at the actual wrist.
 
 Same method as retarget_rby1a_sharpa.py (palm-basis wrist target, least-squares arm
 IK, tip + PIP/IP + DIP finger fit). What differs is the robot:
 
-  * input : a Sharpa H5 that already has grab_source/keypoints
-            (grab_to_contrack_sharpa.py, then sharpa_keypoints.py). Its qpos is ignored.
+  * input : a Sharpa H5 that already has grab_source/keypoints (right hand) and, for
+            --hands left/both, grab_source/keypoints_left
+            (grab_to_contrack_sharpa.py, then sharpa_keypoints.py --side ...). Its qpos is ignored.
   * output: a NEW H5 (--out); the input is never modified.
   * the whole scene (object, keypoints) is first moved by one rigid scene transform
     into the CRX world, whose origin is the LEFT arm base.
@@ -13,8 +14,10 @@ IK, tip + PIP/IP + DIP finger fit). What differs is the robot:
   * --time-scale slows the clip by dividing the stored fps. Human motion at
     original speed can exceed the CRX joint velocity limits.
 
-Only the right hand is retargeted, as in the RB-Y1A route. The left arm holds a
-rest pose with open fingers. No collision avoidance or physics validation.
+--hands selects which human hands are retargeted (default: right only, as in the
+RB-Y1A route). A side that is not retargeted holds its rest pose with open fingers.
+Each arm is solved on its own: there is no arm-arm or arm-object collision
+avoidance and no physics validation.
 """
 import argparse
 import hashlib
@@ -23,7 +26,7 @@ import shutil
 import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
-from crx_sharpa_geometry import (CrxSharpaKinematics, FINGERS, ARM_DOF, HAND_DOF, SIDE_DOF,
+from crx_sharpa_geometry import (CrxSharpaKinematics, FINGERS, ARM_NAMES, ARM_DOF, HAND_DOF, SIDE_DOF,
                                  URDF_NAMES, REST_ARM_DEG, pose_matrix, scene_matrix)
 
 # Scene placement used for the reviewed hammer replay: object near (0.65, -0.40),
@@ -41,6 +44,15 @@ PREVIOUS_RIGHT_BASE = (0.03058936, -0.91156264, 0.00873476, 0.00994493, -0.01029
 ARM_SEEDS_DEG = (REST_ARM_DEG["right"], (-20., -60., 215., -70., -95., -30.),
                  (0., 30., -30., 0., 60., 0.), (-90., 30., -30., 0., 60., 0.),
                  (90., 30., -30., 0., 60., 0.), (180., 30., -30., 0., 60., 0.))
+# The left base is not rotated, so its rest pose already faces the workspace.
+LEFT_ARM_SEEDS_DEG = (REST_ARM_DEG["left"], (-45., 30., -30., 0., 60., 0.),
+                      (-90., 30., -30., 0., 60., 0.), (45., 30., -30., 0., 60., 0.),
+                      (0., -30., 210., 0., -60., 0.), (180., 30., -30., 0., 60., 0.))
+SEEDS_DEG = {"left": LEFT_ARM_SEEDS_DEG, "right": ARM_SEEDS_DEG}
+SIDES = ("left", "right")  # qpos / base order
+KEYPOINT_GROUP = {"left": "grab_source/keypoints_left", "right": "grab_source/keypoints"}
+# The right-hand group names predate left-hand support and are kept unchanged.
+SUFFIX = {"left": "_left", "right": ""}
 GOOD_POSITION_M, GOOD_ROTATION_RAD = 1e-3, np.deg2rad(.5)
 
 
@@ -100,22 +112,25 @@ def transform_points(matrix, points):
     return points @ matrix[:3, :3].T + matrix[:3, 3]
 
 
-def retarget_right(model, arrays, right_base, wrist_offset=(0., 0., 0.), orientation_scale=.05,
-                   intermediate_weight=.35, regularization=.001, progress=None):
+def retarget_side(model, arrays, base, wrist_offset=(0., 0., 0.), orientation_scale=.05,
+                  intermediate_weight=.35, regularization=.001, progress=None):
     """arrays: wrist (T,3), palm (T,3,3), tips (T,5,3), pip (T,5,3), dip (T,4,3) in the CRX world.
 
-    Returns right-side qpos (T,28) plus world-frame targets, achieved poses and errors.
+    model and arrays must belong to the same side; base is that arm's base pose (4x4).
+    Returns that side's qpos (T,28) plus world-frame targets, achieved poses and errors.
+    The human and robot palm frames are built from the same ordered landmarks
+    (wrist, index/middle/pinky MCP) on each side, so no left/right mirroring is applied.
     """
     basis, _ = model.palm_basis()
     target_pos = arrays["wrist"] + np.einsum("tij,j->ti", arrays["palm"], np.asarray(wrist_offset, float))
     target_rot = arrays["palm"] @ basis.T
-    base_inv = np.linalg.inv(right_base)
+    base_inv = np.linalg.inv(base)
     count = len(target_pos)
     qpos = np.zeros((count, SIDE_DOF))
     actual_pos, actual_rot = np.zeros((count, 3)), np.zeros((count, 3, 3))
     pos_err, rot_err, finger_err = np.zeros(count), np.zeros(count), np.zeros((count, 5))
     successes = np.zeros((count, 2), dtype=np.uint8)
-    seeds = [np.deg2rad(s) for s in ARM_SEEDS_DEG]
+    seeds = [np.deg2rad(s) for s in SEEDS_DEG[model.side]]
     arm_q, hand_q = None, np.zeros(HAND_DOF)
     for t in range(count):
         local_pos = base_inv[:3, :3] @ target_pos[t] + base_inv[:3, 3]
@@ -123,7 +138,7 @@ def retarget_right(model, arrays, right_base, wrist_offset=(0., 0., 0.), orienta
         arm = solve_arm(model, local_pos, local_rot, seeds if arm_q is None else [arm_q] + seeds,
                         orientation_scale)
         arm_q = arm.x
-        achieved = right_base @ model.palm_pose(arm_q)
+        achieved = base @ model.palm_pose(arm_q)
         actual_pos[t], actual_rot[t] = achieved[:3, 3], achieved[:3, :3]
         local = {name: (arrays[name][t]-actual_pos[t]) @ actual_rot[t] for name in ("tips", "pip", "dip")}
         fingers = solve_fingers(model, local, hand_q, intermediate_weight, regularization)
@@ -137,20 +152,21 @@ def retarget_right(model, arrays, right_base, wrist_offset=(0., 0., 0.), orienta
         rot_err[t] = Rotation.from_matrix(target_rot[t].T @ actual_rot[t]).magnitude()*180/np.pi
         successes[t] = [arm.success, fingers.success]
         if progress is not None and t % 50 == 0:
-            progress(f"frame {t}/{count}: wrist {pos_err[t]*1000:.2f} mm / {rot_err[t]:.2f} deg")
+            progress(f"{model.side} frame {t}/{count}: wrist {pos_err[t]*1000:.2f} mm / {rot_err[t]:.2f} deg")
     return dict(qpos=qpos, target_pos=target_pos, target_rot=target_rot, actual_pos=actual_pos,
                 actual_rot=actual_rot, pos_err=pos_err, rot_err=rot_err, finger_err=finger_err,
                 successes=successes, basis=basis)
 
 
-def read_keypoints(f):
+def read_keypoints(f, side="right"):
     if not np.array_equal(f["is_rhand"][:], [0, 1]):
         raise ValueError("Expected a two-side (left, right) Sharpa H5")
-    if "grab_source/keypoints" not in f:
-        raise ValueError("Missing grab_source/keypoints: run sharpa_keypoints.py first")
-    k = f["grab_source/keypoints"]
-    if not k.attrs.get("is_rhand", False):
-        raise ValueError("Right-hand keypoints with explicit is_rhand are required")
+    path = KEYPOINT_GROUP[side]
+    if path not in f:
+        raise ValueError(f"Missing {path}: run sharpa_keypoints.py --side {side} on the input first")
+    k = f[path]
+    if "is_rhand" not in k.attrs or bool(k.attrs["is_rhand"]) != (side == "right"):
+        raise ValueError(f"{path} must hold {side}-hand keypoints with an explicit is_rhand attribute")
     count = f["qpos"].shape[0]
     if count == 0:
         raise ValueError("Empty sequence")
@@ -187,15 +203,23 @@ def move_scene(f, scene):
     rm, tm = source["Rm"][:].astype(float), source["tm"][:].astype(float)
     source["Rm"][:] = rotation @ rm
     source["tm"][:] = rotation @ tm + scene[:3, 3]
-    k = source["keypoints"]
-    k["wrist_pos"][:] = transform_points(scene, k["wrist_pos"][:].astype(float))
-    for name in ("wrist_rotmat", "palm_rotmat"):
-        if name in k:
-            k[name][:] = rotation @ k[name][:].astype(float)
-    for name in ("mcp", "tips", "pip", "dip"):
-        if name in k:
-            for dataset in k[name].values():
-                dataset[:] = transform_points(scene, dataset[:].astype(float))
+    for path in KEYPOINT_GROUP.values():
+        if path not in f:
+            continue
+        k = f[path]
+        k["wrist_pos"][:] = transform_points(scene, k["wrist_pos"][:].astype(float))
+        for name in ("wrist_rotmat", "palm_rotmat"):
+            if name in k:
+                k[name][:] = rotation @ k[name][:].astype(float)
+        for name in ("mcp", "tips", "pip", "dip"):
+            if name in k:
+                for dataset in k[name].values():
+                    dataset[:] = transform_points(scene, dataset[:].astype(float))
+
+
+def urdf_sha256(path):
+    """LF-normalized, matching ConTrack's asset record: ties a file to one arm model."""
+    return hashlib.sha256(Path(path).read_bytes().replace(bytes([13, 10]), bytes([10]))).hexdigest()
 
 
 def main():
@@ -204,6 +228,11 @@ def main():
     ap.add_argument("--out", required=True, help="New CRX+Sharpa H5")
     ap.add_argument("--right-urdf", required=True,
                     help="Single-arm right model; for training use ConTrack assets/urdf/crx_sharpa_right.urdf")
+    ap.add_argument("--left-urdf",
+                    help="Single-arm left model (ConTrack assets/urdf/crx_sharpa_left.urdf); "
+                         "required for --hands left/both")
+    ap.add_argument("--hands", choices=("right", "left", "both"), default="right",
+                    help="Human hands to retarget; the other arm holds its rest pose")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--scene-transform", type=float, nargs=4, default=DEFAULT_SCENE,
                     metavar=("X", "Y", "Z", "YAW_DEG"), help="Source world -> CRX world (left base origin)")
@@ -213,7 +242,9 @@ def main():
                     metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
                     help="Meters/radians. Default is the current dual_crx_control calibration")
     ap.add_argument("--left-rest-deg", type=float, nargs=6, default=REST_ARM_DEG["left"],
-                    help="Left arm J1..J6 in ROS/URDF degrees; left fingers stay at zero")
+                    help="Left arm J1..J6 in ROS/URDF degrees when the left hand is not retargeted")
+    ap.add_argument("--right-rest-deg", type=float, nargs=6, default=REST_ARM_DEG["right"],
+                    help="Right arm J1..J6 in ROS/URDF degrees when the right hand is not retargeted")
     ap.add_argument("--time-scale", type=float, default=1.,
                     help="Duration multiplier >= 1. Frames are unchanged; the stored fps is divided")
     ap.add_argument("--wrist-offset-palm", type=float, nargs=3, default=(0., 0., 0.))
@@ -222,53 +253,75 @@ def main():
     ap.add_argument("--regularization", type=float, default=.001, help="previous finger pose weight, m/rad")
     args = ap.parse_args()
     numbers = np.r_[args.scene_transform, args.left_base, args.right_base, args.left_rest_deg,
-                    args.wrist_offset_palm, args.orientation_scale, args.intermediate_weight, args.regularization]
+                    args.right_rest_deg, args.wrist_offset_palm, args.orientation_scale,
+                    args.intermediate_weight, args.regularization]
     if not np.isfinite(args.time_scale) or args.time_scale < 1.:
         ap.error("--time-scale must be finite and >= 1")
     if (not np.isfinite(numbers).all() or args.orientation_scale <= 0
             or args.intermediate_weight < 0 or args.regularization < 0):
         ap.error("All values must be finite; weights nonnegative, orientation scale positive")
+    active = SIDES if args.hands == "both" else (args.hands,)
+    if "left" in active and not args.left_urdf:
+        ap.error("--hands left/both needs --left-urdf")
     source, out = Path(args.h5).resolve(), Path(args.out).resolve()
     if source == out:
         ap.error("--out must differ from --h5; the input is never modified")
     if out.exists() and not args.overwrite:
         ap.error(f"{out} exists; pass --overwrite or choose a new name")
     import h5py
-    model = CrxSharpaKinematics(args.right_urdf, "right")
+    urdfs = {"left": args.left_urdf, "right": args.right_urdf}
+    models = {side: CrxSharpaKinematics(urdfs[side], side) for side in SIDES if urdfs[side]}
     scene = scene_matrix(*args.scene_transform[:3], np.deg2rad(args.scene_transform[3]))
     bases = np.stack([pose_matrix(args.left_base), pose_matrix(args.right_base)])
-    left_rest = np.deg2rad(args.left_rest_deg)
-    arm_bounds = model.limits(model.arm_names)  # both CRX-5iA arms share joint limits
-    if np.any(left_rest < arm_bounds[:, 0]) or np.any(left_rest > arm_bounds[:, 1]):
-        ap.error("--left-rest-deg is outside the CRX joint limits")
+    rest = {"left": np.deg2rad(args.left_rest_deg), "right": np.deg2rad(args.right_rest_deg)}
+    arm_bounds = models["right"].limits(ARM_NAMES)  # both CRX-5iA arms share joint limits
+    for side in SIDES:
+        if side not in active and (np.any(rest[side] < arm_bounds[:, 0])
+                                   or np.any(rest[side] > arm_bounds[:, 1])):
+            ap.error(f"--{side}-rest-deg is outside the CRX joint limits")
     with h5py.File(source, "r") as f:
-        arrays = read_keypoints(f)
+        arrays = {side: read_keypoints(f, side) for side in active}
         source_fps = f["fps"][:].astype(float)
         if not np.isfinite(source_fps).all() or np.any(source_fps <= 0):
             raise ValueError("Invalid source fps")
         if "contacts/0/is_contact" in f:
-            left_frames = int(f["contacts/0/is_contact"][:, 0].any(axis=1).sum())
-            if left_frames:
-                print(f"Note: GRAB has left-hand contact in {left_frames} frames; this right-only solver keeps the left arm at rest.")
-    arrays = {name: (scene[:3, :3] @ value if name == "palm" else transform_points(scene, value))
-              for name, value in arrays.items()}
-    result = retarget_right(model, arrays, bases[1], args.wrist_offset_palm, args.orientation_scale,
-                            args.intermediate_weight, args.regularization, progress=print)
-    count = len(result["qpos"])
+            contact_frames = f["contacts/0/is_contact"][:].any(axis=2).sum(axis=0)  # (left, right)
+            for index, side in enumerate(SIDES):
+                if contact_frames[index] and side not in active:
+                    print(f"Note: GRAB has {side}-hand contact in {int(contact_frames[index])} frames, but "
+                          f"--hands {args.hands} keeps the {side} arm at rest. The object then follows a "
+                          "motion this robot does not produce; use --hands both for this clip.")
+                if not contact_frames[index] and side in active:
+                    print(f"Note: the {side} hand never touches the object in this clip; the {side} arm "
+                          f"still follows the human's free {side}-hand motion.")
+    results = {}
+    for side in active:
+        moved = {name: (scene[:3, :3] @ value if name == "palm" else transform_points(scene, value))
+                 for name, value in arrays[side].items()}
+        results[side] = retarget_side(models[side], moved, bases[SIDES.index(side)], args.wrist_offset_palm,
+                                      args.orientation_scale, args.intermediate_weight,
+                                      args.regularization, progress=print)
+    count = len(next(iter(results.values()))["qpos"])
     qpos = np.zeros((count, 2, SIDE_DOF), dtype=np.float32)
-    qpos[:, 0, :ARM_DOF] = left_rest
-    qpos[:, 1] = result["qpos"]
-    names = model.arm_names + model.hand_names
-    bounds = model.limits(names)
-    lower = qpos[:, 1]-bounds[:, 0] < 1e-3
-    upper = bounds[:, 1]-qpos[:, 1] < 1e-3
-    arm_delta = np.abs(np.diff(result["qpos"][:, :ARM_DOF], axis=0)) if count > 1 else np.zeros((1, ARM_DOF))
-    arm_step = arm_delta.max(axis=1)
     fps = source_fps / args.time_scale
-    velocity_limit = model.velocity_limits(model.arm_names)
-    arm_speed = arm_delta * float(fps.max())
-    # Smallest total slowdown, relative to the source clip, that keeps every arm joint in limits.
-    needed_scale = float((arm_delta * float(source_fps.max()) / velocity_limit).max())
+    report = {}
+    for index, side in enumerate(SIDES):
+        if side not in active:
+            qpos[:, index, :ARM_DOF] = rest[side]
+            continue
+        model, result = models[side], results[side]
+        qpos[:, index] = result["qpos"]
+        names = model.arm_names + model.hand_names
+        bounds = model.limits(names)
+        arm_delta = (np.abs(np.diff(result["qpos"][:, :ARM_DOF], axis=0)) if count > 1
+                     else np.zeros((1, ARM_DOF)))
+        velocity_limit = model.velocity_limits(model.arm_names)
+        report[side] = dict(
+            names=names, lower=qpos[:, index]-bounds[:, 0] < 1e-3, upper=bounds[:, 1]-qpos[:, index] < 1e-3,
+            arm_step=arm_delta.max(axis=1), velocity_limit=velocity_limit,
+            arm_speed=arm_delta * float(fps.max()),
+            # Smallest total slowdown, relative to the source clip, that keeps this arm in limits.
+            needed_scale=float((arm_delta * float(source_fps.max()) / velocity_limit).max()))
 
     out.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(source, out)
@@ -288,63 +341,85 @@ def main():
             f.attrs["qpos_is_placeholder"] = 0
             f.attrs["robot"] = "crx5ia_sharpa_wave"
             f.attrs["qpos_layout"] = "per side: J1..J6 then 22 Sharpa joints (thumb,index,middle,ring,pinky)"
-            f.attrs["retarget_method"] = "crx_sharpa_right_palm_intermediate"
+            f.attrs["retarget_method"] = ("crx_sharpa_right_palm_intermediate" if args.hands == "right"
+                                          else "crx_sharpa_palm_intermediate")
+            f.attrs["retargeted_hands"] = args.hands
             f.attrs["scene_transform_xyz_yaw_deg"] = np.asarray(args.scene_transform, float)
             f.attrs["right_base_verified"] = 0
-            # LF-normalized, matching ConTrack's asset record: ties this file to one arm model.
-            f.attrs["right_urdf_sha256"] = hashlib.sha256(
-                Path(args.right_urdf).read_bytes().replace(bytes([13, 10]), bytes([10]))).hexdigest()
-            f.attrs["right_urdf_name"] = Path(args.right_urdf).name
+            for side in SIDES:
+                if urdfs[side]:
+                    f.attrs[f"{side}_urdf_sha256"] = urdf_sha256(urdfs[side])
+                    f.attrs[f"{side}_urdf_name"] = Path(urdfs[side]).name
             f.attrs["time_scale"] = args.time_scale
             f.attrs["source_fps"] = source_fps
             f.attrs["retarget_wrist_offset_palm_m"] = args.wrist_offset_palm
             f.attrs["retarget_intermediate_weight"] = args.intermediate_weight
             f.attrs["retarget_regularization_m_per_rad"] = args.regularization
             f.attrs["retarget_orientation_scale_m_per_rad"] = args.orientation_scale
-            for path in ("grab_source/wrist_targets", "grab_source/sharpa_diagnostics"):
-                if path in f:
-                    del f[path]
-            g = f.create_group("grab_source/wrist_targets")
-            for name, data in (("positions", result["target_pos"]), ("rotations", result["target_rot"]),
-                               ("actual_positions", result["actual_pos"]),
-                               ("actual_rotations", result["actual_rot"]),
-                               ("robot_palm_basis", result["basis"])):
-                g.create_dataset(name, data=data)
-            d = f.create_group("grab_source/sharpa_diagnostics")
-            for name, data in (("wrist_position_error_m", result["pos_err"]),
-                               ("wrist_rotation_error_deg", result["rot_err"]),
-                               ("tip_error_m", result["finger_err"]), ("lower_limit", lower),
-                               ("upper_limit", upper), ("optimizer_success", result["successes"]),
-                               ("arm_step_max_rad", arm_step)):
-                d.create_dataset(name, data=data)
-            d.create_dataset("joint_names", data=np.array(names, dtype="S40"))
-            d.create_dataset("finger_names", data=np.array(FINGERS, dtype="S10"))
+            for side in SIDES:
+                for path in (f"grab_source/wrist_targets{SUFFIX[side]}",
+                             f"grab_source/sharpa_diagnostics{SUFFIX[side]}"):
+                    if path in f:
+                        del f[path]
+            for side in active:
+                result, info = results[side], report[side]
+                g = f.create_group(f"grab_source/wrist_targets{SUFFIX[side]}")
+                for name, data in (("positions", result["target_pos"]), ("rotations", result["target_rot"]),
+                                   ("actual_positions", result["actual_pos"]),
+                                   ("actual_rotations", result["actual_rot"]),
+                                   ("robot_palm_basis", result["basis"])):
+                    g.create_dataset(name, data=data)
+                d = f.create_group(f"grab_source/sharpa_diagnostics{SUFFIX[side]}")
+                for name, data in (("wrist_position_error_m", result["pos_err"]),
+                                   ("wrist_rotation_error_deg", result["rot_err"]),
+                                   ("tip_error_m", result["finger_err"]), ("lower_limit", info["lower"]),
+                                   ("upper_limit", info["upper"]), ("optimizer_success", result["successes"]),
+                                   ("arm_step_max_rad", info["arm_step"])):
+                    d.create_dataset(name, data=data)
+                d.create_dataset("joint_names", data=np.array(info["names"], dtype="S40"))
+                d.create_dataset("finger_names", data=np.array(FINGERS, dtype="S10"))
     except Exception:
         out.unlink(missing_ok=True)  # never leave a half-converted file that looks valid
         raise
-    pos_err, rot_err, finger_err = result["pos_err"], result["rot_err"], result["finger_err"]
-    print("Wrist position mean/max (mm):", pos_err.mean()*1000, pos_err.max()*1000)
-    print("Wrist orientation mean/max (deg):", rot_err.mean(), rot_err.max())
-    for i, name in enumerate(FINGERS):
-        print(f"{name}: tip mean {finger_err[:, i].mean()*1000:.4f}, max {finger_err[:, i].max()*1000:.4f} mm")
-    print("Per-joint lower/upper saturation (%):")
-    for i, name in enumerate(names):
-        print(f"{name}: {lower[:, i].mean()*100:.1f} / {upper[:, i].mean()*100:.1f}")
-    print("Optimizer success counts (arm/fingers):", result["successes"].sum(axis=0), "/", count)
-    print(f"Largest arm joint change between frames: {arm_step.max():.4f} rad at frame {int(arm_step.argmax())+1}")
+    over_any = unreached = jumps = False
+    for side in active:
+        result, info = results[side], report[side]
+        pos_err, rot_err, finger_err = result["pos_err"], result["rot_err"], result["finger_err"]
+        if len(active) > 1:
+            print(f"===== {side} arm =====")
+        print("Wrist position mean/max (mm):", pos_err.mean()*1000, pos_err.max()*1000)
+        print("Wrist orientation mean/max (deg):", rot_err.mean(), rot_err.max())
+        for i, name in enumerate(FINGERS):
+            print(f"{name}: tip mean {finger_err[:, i].mean()*1000:.4f}, max {finger_err[:, i].max()*1000:.4f} mm")
+        print("Per-joint lower/upper saturation (%):")
+        for i, name in enumerate(info["names"]):
+            print(f"{name}: {info['lower'][:, i].mean()*100:.1f} / {info['upper'][:, i].mean()*100:.1f}")
+        print("Optimizer success counts (arm/fingers):", result["successes"].sum(axis=0), "/", count)
+        print(f"Largest arm joint change between frames: {info['arm_step'].max():.4f} rad "
+              f"at frame {int(info['arm_step'].argmax())+1}")
+        print("Arm joint speed max (rad/s):", np.round(info["arm_speed"].max(axis=0), 2),
+              "limits:", np.round(info["velocity_limit"], 2))
+        over = (info["arm_speed"] > info["velocity_limit"]).any(axis=1)
+        print(f"Frames over an arm velocity limit: {int(over.sum())} of {len(over)}; "
+              f"smallest --time-scale that removes them: {info['needed_scale']:.2f}")
+        over_any = over_any or bool(over.any())
+        unreached = unreached or bool(pos_err.max() > .01 or rot_err.max() > 5.)
+        jumps = jumps or bool(info["arm_step"].max() > .3)
+    if len(active) > 1:
+        print("===== both arms =====")
+        print("Smallest --time-scale that keeps both arms in limits: "
+              f"{max(info['needed_scale'] for info in report.values()):.2f}")
+        gap = np.linalg.norm(results["left"]["actual_pos"] - results["right"]["actual_pos"], axis=1)
+        print(f"Palm-to-palm distance: min {gap.min()*1000:.0f} mm at frame {int(gap.argmin())} "
+              "(information only; arm-arm collisions are not checked)")
     print(f"Time scale {args.time_scale:g}: stored fps {fps.max():g}, duration {(count-1)/fps.max():.2f} s")
-    print("Arm joint speed max (rad/s):", np.round(arm_speed.max(axis=0), 2),
-          "limits:", np.round(velocity_limit, 2))
-    over = (arm_speed > velocity_limit).any(axis=1)
-    print(f"Frames over an arm velocity limit: {int(over.sum())} of {len(over)}; "
-          f"smallest --time-scale that removes them: {needed_scale:.2f}")
-    if over.any():
+    if over_any:
         print("WARNING: the arm cannot follow this clip at the stored speed. "
               "Rerun with a larger --time-scale.")
-    if pos_err.max() > .01 or rot_err.max() > 5.:
+    if unreached:
         print("WARNING: wrist target not reached in some frames (unreachable or at a joint limit). "
               "Adjust --scene-transform or the base pose before training on this file.")
-    if arm_step.max() > .3:
+    if jumps:
         print("WARNING: the arm jumps between IK branches. Inspect before use; a 6-axis arm cannot "
               "blend between branches without leaving the wrist target.")
     print("Saved", out)

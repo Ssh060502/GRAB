@@ -24,8 +24,10 @@ def load(path):
                     Rotation.from_quat(g["orientations_xyzw"][:]).as_matrix())
                    for g in f["object_tracks"].values()]
         tips = None
-        if "grab_source/keypoints/tips" in f:
-            tips = np.stack([f["grab_source/keypoints/tips"][n][:] for n in FINGERS], axis=1)
+        for group in ("grab_source/keypoints/tips", "grab_source/keypoints_left/tips"):
+            if group in f:
+                side_tips = np.stack([f[group][n][:] for n in FINGERS], axis=1)
+                tips = side_tips if tips is None else np.concatenate([tips, side_tips], axis=1)
         scene = f.attrs.get("scene_transform_xyz_yaw_deg")
         table_z = None if scene is None else float(scene[2])
         return q, bases, objects, tips, float(np.max(f["fps"][:])), table_z
@@ -50,6 +52,8 @@ def render(models, q, bases, objects, tips, fps, table_z, out, frame=None, strid
     points = np.concatenate(points)
     center = (points.min(axis=0) + points.max(axis=0)) / 2
     radius = max(float(np.ptp(points, axis=0).max()) * .55, .2)
+    # A left arm that only holds its rest pose is drawn gray without tip markers.
+    retargeted_left = tips is not None and tips.shape[1] == 2 * len(FINGERS)
     ids = [frame] if frame is not None else range(0, len(q), stride)
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     writer = None if frame is not None else imageio.get_writer(out, fps=fps / stride)
@@ -60,14 +64,15 @@ def render(models, q, bases, objects, tips, fps, table_z, out, frame=None, strid
             ax.clear()
             for side, model in models.items():
                 poses = world_poses(side, t)
-                color = "tab:blue" if side == 1 else "gray"
+                color = "tab:blue" if side == 1 or retargeted_left else "gray"
                 for joint in model.joints:
                     p = np.stack([poses[n][:3, 3] for n in (joint["parent"], joint["child"])])
                     ax.plot(p[:, 0], p[:, 1], p[:, 2], color=color, linewidth=1.5)
                 ax.scatter(*bases[side][:3, 3], color="black", s=30, marker="s")
-                if side == 1:
+                if side == 1 or retargeted_left:
                     robot_tips = np.stack([poses[n][:3, 3] for n in model.tip_links])
-                    ax.scatter(*robot_tips.T, color="tab:blue", s=15, label="robot tips")
+                    ax.scatter(*robot_tips.T, color="tab:blue", s=15,
+                               label="robot tips" if side == 1 else None)
                     wrist = poses[model.palm_link]
                     for i, axis_color in enumerate(("red", "green", "blue")):
                         p = np.stack([wrist[:3, 3], wrist[:3, 3] + .06 * wrist[:3, i]])
@@ -105,7 +110,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--h5", required=True)
     ap.add_argument("--right-urdf", required=True)
-    ap.add_argument("--left-urdf", help="Optional; without it only the right arm is drawn")
+    ap.add_argument("--left-urdf", help="Optional; without it only the right arm is drawn. "
+                                        "Use it for files made with --hands left/both")
     ap.add_argument("--out", required=True, help="PNG with --frame, otherwise MP4")
     ap.add_argument("--frame", type=int)
     ap.add_argument("--stride", type=int, default=4)
